@@ -1,0 +1,8 @@
+.DS_Store
+/build*/
+/cmake-build-*/
+/out/
+CMakeUserPresets.json
+compile_commands.json
+*.jucer
+*.log
