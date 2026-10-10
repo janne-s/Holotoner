@@ -22,16 +22,18 @@ repository. Public documentation belongs here.
 
 ## Current development foundation
 
-The portable core currently establishes two invariants:
+The portable core currently establishes three invariants:
 
 1. one canonical three-axis plane projection for future native and web views;
 2. a smoothed signed mid/side baseline where a centred plane at 90 degrees yaw
-   is mono and 180 degrees reverses the side channel.
+   is mono and 180 degrees reverses the side channel;
+3. an allocation-free test-source player that resamples and seamlessly loops
+   immutable audio loaded away from the audio thread.
 
 This is foundation work, not a released feature set. Image import, the final
 spectral mono-to-stereo path, direct-manipulation UI, the full polar analyser,
-the Standalone file source and the web application must be complete before the
-first release.
+the Standalone source controls and the web application must be complete before
+the first release.
 
 ## Build the core and tests
 
@@ -56,8 +58,10 @@ cmake --build build-native --parallel
 ```
 
 The current JUCE wrapper is intentionally a development shell around the tested
-baseline. It is not a Holotoner release and does not yet implement the agreed
-Standalone file-player workflow.
+baseline. Its Standalone target starts with a test click, and the processor has
+the off-thread file-loader and host-transport-aware playback path. The source
+controls and the agreed two-panel editor are the next development stage; this
+is not yet a Holotoner release.
 
 ## Licence
 

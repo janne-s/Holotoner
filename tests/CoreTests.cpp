@@ -1,3 +1,5 @@
+#include "core/audio/SharedExchange.h"
+#include "core/audio/SourcePlayer.h"
 #include "core/dsp/StereoWidth.h"
 #include "core/geometry/PlaneProjection.h"
 
@@ -6,6 +8,7 @@
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string_view>
 
 namespace {
@@ -164,6 +167,57 @@ void invalidValuesAreContained()
     }
 }
 
+void sourcePlayerIsDeterministic()
+{
+    holotoner::SourcePlayer player;
+    player.prepare(8.0);
+    std::array<float, 8> left {};
+    std::array<float, 8> right {};
+    player.render(holotoner::SourceKind::Clicks, nullptr, left.data(), right.data(), 4);
+    player.render(holotoner::SourceKind::Clicks, nullptr, left.data() + 4, right.data() + 4, 4);
+    expectNear(left[0], 1.0f, 0.0f, "first click");
+    expectNear(left[6], 1.0f, 0.0f, "second click across blocks");
+    for (std::size_t i = 0; i < left.size(); ++i)
+        expectNear(right[i], left[i], 0.0f, "clicks are stereo-identical");
+
+    holotoner::SourceAudio file;
+    file.sampleRate = 4.0;
+    file.left = {0.0f, 1.0f, 0.0f, -1.0f};
+    file.right = {1.0f, 0.0f, -1.0f, 0.0f};
+    player.prepare(8.0);
+    player.render(holotoner::SourceKind::File, &file, left.data(), right.data(), 4);
+    expectNear(left[0], 0.0f, 0.0f, "file starts at beginning");
+    expectNear(left[1], 0.5f, 1.0e-6f, "file resamples linearly");
+    expectNear(left[2], 1.0f, 1.0e-6f, "file reaches source sample");
+
+    left.fill(0.25f);
+    right.fill(-0.25f);
+    player.render(holotoner::SourceKind::Input, nullptr, left.data(), right.data(), 8);
+    expectNear(left[7], 0.25f, 0.0f, "input remains untouched");
+    expectNear(right[7], -0.25f, 0.0f, "input right remains untouched");
+}
+
+void sharedExchangeRetiresOffAudioPath()
+{
+    holotoner::SharedExchange<int> exchange;
+    auto first = std::make_shared<const int>(7);
+    exchange.publish(first);
+    if (exchange.acquire() == nullptr || *exchange.acquire() != 7) {
+        std::cerr << "shared exchange did not publish first value\n";
+        ++failures;
+    }
+    exchange.publish(std::make_shared<const int>(9));
+    if (exchange.acquire() == nullptr || *exchange.acquire() != 9) {
+        std::cerr << "shared exchange did not publish replacement\n";
+        ++failures;
+    }
+    exchange.collectGarbage();
+    if (exchange.currentShared() == nullptr || *exchange.currentShared() != 9) {
+        std::cerr << "shared exchange collected current value\n";
+        ++failures;
+    }
+}
+
 } // namespace
 
 int main()
@@ -175,6 +229,8 @@ int main()
     blockPartitionIsIndependent();
     dryIsExact();
     invalidValuesAreContained();
+    sourcePlayerIsDeterministic();
+    sharedExchangeRetiresOffAudioPath();
     if (failures != 0)
         std::cerr << failures << " test assertion(s) failed\n";
     return failures == 0 ? 0 : 1;

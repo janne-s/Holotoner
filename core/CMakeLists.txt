@@ -1,4 +1,5 @@
 add_library(holotoner_core STATIC
+    audio/SourcePlayer.cpp
     dsp/StereoWidth.cpp
     geometry/PlaneProjection.cpp)
 
