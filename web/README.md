@@ -8,8 +8,9 @@ implementation to drift away from the native product.
 The accepted boundary is:
 
 - JavaScript owns file selection, responsive UI and rendering.
-- A worker or the main UI thread decodes images and builds immutable control
-  data away from audio rendering.
+- A worker or the main UI thread decodes images to straight-alpha RGBA away
+  from audio rendering; the shared C++ core builds the same fixed-size mask as
+  the native wrapper.
 - AudioWorklet owns real-time audio scheduling.
 - The C++20 core is compiled to WebAssembly and performs the same geometry and
   DSP as the native formats.

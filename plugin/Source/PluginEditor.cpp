@@ -61,6 +61,12 @@ public:
         setMouseCursor(juce::MouseCursor::DraggingHandCursor);
     }
 
+    void setImage(juce::Image image)
+    {
+        image_ = std::move(image);
+        repaint();
+    }
+
     void paint(juce::Graphics& graphics) override
     {
         const auto well = getLocalBounds().toFloat();
@@ -89,17 +95,31 @@ public:
             plane.lineTo(points[i]);
         plane.closeSubPath();
 
-        const juce::ColourGradient surface(style::signal.withAlpha(0.42f), points[3].x, points[3].y,
-                                           style::link.withAlpha(0.24f), points[1].x, points[1].y, false);
-        graphics.setGradientFill(surface);
-        graphics.fillPath(plane);
-        graphics.setColour(style::text.withAlpha(0.28f));
-        for (int i = 1; i < 5; ++i) {
-            juce::Path line;
-            const auto t = static_cast<float>(i) / 5.0f;
-            line.startNewSubPath(points[0] + (points[3] - points[0]) * t);
-            line.lineTo(points[1] + (points[2] - points[1]) * t);
-            graphics.strokePath(line, juce::PathStrokeType(0.75f));
+        if (image_.isValid()) {
+            graphics.saveState();
+            graphics.reduceClipRegion(plane);
+            graphics.setImageResamplingQuality(juce::Graphics::highResamplingQuality);
+            const auto transform = juce::AffineTransform::fromTargetPoints(
+                juce::Point<float> {0.0f, static_cast<float>(image_.getHeight())}, points[0],
+                juce::Point<float> {static_cast<float>(image_.getWidth()), static_cast<float>(image_.getHeight())}, points[1],
+                juce::Point<float> {static_cast<float>(image_.getWidth()), 0.0f}, points[2]);
+            graphics.drawImageTransformed(image_, transform);
+            graphics.setColour(style::signal.withAlpha(0.10f));
+            graphics.fillPath(plane);
+            graphics.restoreState();
+        } else {
+            const juce::ColourGradient surface(style::signal.withAlpha(0.42f), points[3].x, points[3].y,
+                                               style::link.withAlpha(0.24f), points[1].x, points[1].y, false);
+            graphics.setGradientFill(surface);
+            graphics.fillPath(plane);
+            graphics.setColour(style::text.withAlpha(0.28f));
+            for (int i = 1; i < 5; ++i) {
+                juce::Path line;
+                const auto t = static_cast<float>(i) / 5.0f;
+                line.startNewSubPath(points[0] + (points[3] - points[0]) * t);
+                line.lineTo(points[1] + (points[2] - points[1]) * t);
+                graphics.strokePath(line, juce::PathStrokeType(0.75f));
+            }
         }
         graphics.setColour(style::signal);
         graphics.strokePath(plane, juce::PathStrokeType(1.5f));
@@ -267,6 +287,7 @@ private:
     }
 
     HolotonerProcessor& processor_;
+    juce::Image image_;
     PlaneTransform start_;
     Drag drag_ = Drag::None;
 };
@@ -276,6 +297,14 @@ public:
     explicit PolarView(HolotonerProcessor& processor) : processor_(processor)
     {
         setInterceptsMouseClicks(false, false);
+    }
+
+    void setMask(const holotoner::ImageMask* mask)
+    {
+        hasMask_ = mask != nullptr;
+        if (mask != nullptr)
+            mask_ = *mask;
+        repaint();
     }
 
     void paint(juce::Graphics& graphics) override
@@ -300,6 +329,8 @@ public:
         }
 
         const auto projected = holotoner::projectPlane(processor_.planeTransform());
+        if (hasMask_)
+            drawMask(graphics, centre, radius, projected);
         juce::Path plane;
         for (std::size_t i = 0; i < projected.corners.size(); ++i) {
             const auto point = polarPoint(centre, radius, projected.corners[i]);
@@ -343,6 +374,33 @@ public:
     }
 
 private:
+    void drawMask(juce::Graphics& graphics, juce::Point<float> centre, float radius,
+                  const ProjectedPlane& projected) const
+    {
+        constexpr int stride = 4;
+        for (int y = 0; y < holotoner::kImageMaskHeight; y += stride)
+            for (int x = 0; x < holotoner::kImageMaskWidth; x += stride) {
+                const auto value = mask_.at(x, y);
+                if (value <= 0.01f)
+                    continue;
+                const auto u = static_cast<float>(x) / static_cast<float>(holotoner::kImageMaskWidth - 1);
+                const auto topToBottom = static_cast<float>(y) / static_cast<float>(holotoner::kImageMaskHeight - 1);
+                const auto vertical = 1.0f - topToBottom;
+                const auto interpolate = [](const holotoner::ProjectedPoint& a,
+                                            const holotoner::ProjectedPoint& b, float amount) {
+                    return holotoner::ProjectedPoint {a.stereo + amount * (b.stereo - a.stereo),
+                                                       a.frequency + amount * (b.frequency - a.frequency),
+                                                       a.depth + amount * (b.depth - a.depth)};
+                };
+                const auto bottom = interpolate(projected.corners[0], projected.corners[1], u);
+                const auto top = interpolate(projected.corners[3], projected.corners[2], u);
+                const auto sample = interpolate(bottom, top, vertical);
+                const auto point = polarPoint(centre, radius, sample);
+                graphics.setColour(style::text.withAlpha(0.04f + 0.13f * value));
+                graphics.fillEllipse(juce::Rectangle<float>(5.0f, 5.0f).withCentre(point));
+            }
+    }
+
     static void drawMeter(juce::Graphics& graphics, juce::Point<float> centre, float maximumRadius,
                           float left, float right, juce::Colour colour, float width)
     {
@@ -359,6 +417,8 @@ private:
     }
 
     HolotonerProcessor& processor_;
+    holotoner::ImageMask mask_;
+    bool hasMask_ = false;
 };
 
 HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
@@ -387,8 +447,9 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
     loadAudio_.onClick = [this] { chooseAudioFile(); };
     restart_.onClick = [this] { processor_.restartSource(); };
     play_.onClick = [this] { processor_.toggleSourcePlaying(); };
+    loadImage_.onClick = [this] { chooseImageFile(); };
     reset_.onClick = [this] { resetTransform(); };
-    const std::array<juce::Component*, 5> barComponents {&source_, &loadAudio_, &restart_, &play_, &reset_};
+    const std::array<juce::Component*, 6> barComponents {&source_, &loadAudio_, &restart_, &play_, &loadImage_, &reset_};
     for (auto* component : barComponents)
         addAndMakeVisible(component);
 
@@ -445,6 +506,8 @@ void HolotonerEditor::resized()
     bar.removeFromLeft(4);
     play_.setBounds(bar.removeFromLeft(52));
     bar.removeFromLeft(12);
+    loadImage_.setBounds(bar.removeFromLeft(68));
+    bar.removeFromLeft(4);
     reset_.setBounds(bar.removeFromLeft(82));
     wet_.setBounds(bar.removeFromRight(190));
     wetLabel_.setBounds(bar.removeFromRight(38));
@@ -470,14 +533,22 @@ bool HolotonerEditor::keyPressed(const juce::KeyPress& key)
 
 bool HolotonerEditor::isInterestedInFileDrag(const juce::StringArray& files)
 {
-    return files.size() == 1 && HolotonerProcessor::isSupportedAudioFile(juce::File(files[0]));
+    if (files.size() != 1)
+        return false;
+    const juce::File file(files[0]);
+    return HolotonerProcessor::isSupportedAudioFile(file) || HolotonerProcessor::isSupportedImageFile(file);
 }
 
 void HolotonerEditor::filesDropped(const juce::StringArray& files, int, int)
 {
     dragOver_ = false;
-    if (isInterestedInFileDrag(files))
-        processor_.loadSourceFile(juce::File(files[0]));
+    if (isInterestedInFileDrag(files)) {
+        const juce::File file(files[0]);
+        if (HolotonerProcessor::isSupportedImageFile(file))
+            processor_.loadImageFile(file);
+        else
+            processor_.loadSourceFile(file);
+    }
     repaint();
 }
 
@@ -513,6 +584,19 @@ void HolotonerEditor::chooseAudioFile()
                           });
 }
 
+void HolotonerEditor::chooseImageFile()
+{
+    chooser_ = std::make_unique<juce::FileChooser>("Load an image into Holotoner", juce::File {},
+                                                   "*.png;*.jpg;*.jpeg;*.gif");
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                          [this](const juce::FileChooser& chooser) {
+                              const auto file = chooser.getResult();
+                              if (file.existsAsFile())
+                                  processor_.loadImageFile(file);
+                              refresh();
+                          });
+}
+
 void HolotonerEditor::resetTransform()
 {
     constexpr std::array<const char*, 7> ids {"position_x", "position_y", "scale_x", "scale_y", "pitch", "yaw", "roll"};
@@ -536,8 +620,19 @@ void HolotonerEditor::refresh()
                              && !processor_.isWaitingForHost(),
                          juce::dontSendNotification);
 
+    const auto image = processor_.imageDocument();
+    if (image != currentImage_) {
+        currentImage_ = image;
+        planeView_->setImage(image != nullptr ? image->image : juce::Image {});
+        polarView_->setMask(image != nullptr ? &image->lumaMask : nullptr);
+    }
+
     juce::String message;
-    if (processor_.isLoadingSource())
+    if (processor_.isLoadingImage())
+        message = "Loading image...";
+    else if (processor_.lastImageMessage().isNotEmpty())
+        message = processor_.lastImageMessage();
+    else if (processor_.isLoadingSource())
         message = "Loading audio...";
     else if (processor_.isWaitingForHost())
         message = "Source waits for host transport";
@@ -548,5 +643,7 @@ void HolotonerEditor::refresh()
     else
         message = kind == SourceKind::Clicks ? "Test clicks - Space toggles playback in Standalone"
                                              : "Host input";
+    if (image != nullptr)
+        message += "    Image: " + image->name;
     status_.setText(message + "    Plane gestures are automatable; polar is read-only.", juce::dontSendNotification);
 }

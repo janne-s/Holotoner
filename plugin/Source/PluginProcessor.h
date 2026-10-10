@@ -3,10 +3,12 @@
 #include "core/audio/SharedExchange.h"
 #include "core/audio/SourcePlayer.h"
 #include "core/dsp/StereoWidth.h"
+#include "core/image/ImageMask.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 
 /**
@@ -24,6 +26,13 @@ public:
         float outputLeft = 0.0f;
         float outputRight = 0.0f;
         float outputCorrelation = 0.0f;
+    };
+
+    struct ImageDocument {
+        juce::Image image;
+        juce::MemoryBlock normalizedPng;
+        juce::String name;
+        holotoner::ImageMask lumaMask;
     };
 
     HolotonerProcessor();
@@ -73,10 +82,18 @@ public:
     juce::String lastSourceMessage() const;
     static bool isSupportedAudioFile(const juce::File& file);
 
+    void loadImageFile(const juce::File& file);
+    std::shared_ptr<const ImageDocument> imageDocument() const;
+    bool isLoadingImage() const { return imageLoadsPending_.load() > 0; }
+    juce::String lastImageMessage() const;
+    static bool isSupportedImageFile(const juce::File& file);
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout parameterLayout();
     void timerCallback() override;
     void setSourceMessage(const juce::String& message);
+    void loadImageData(juce::MemoryBlock data, juce::String name, std::uint64_t request);
+    void setImageMessage(const juce::String& message);
 
     juce::AudioProcessorValueTreeState parameters_;
     std::atomic<float>* positionX_ = nullptr;
@@ -110,8 +127,13 @@ private:
     mutable std::mutex sourceInfoMutex_;
     juce::File sourceFile_;
     juce::String sourceMessage_;
-    /** Jobs refer to the source members, so the destructor waits for them. */
-    juce::ThreadPool sourceLoader_ {1};
+    std::atomic<int> imageLoadsPending_ {0};
+    std::atomic<std::uint64_t> imageRequest_ {0};
+    mutable std::mutex imageMutex_;
+    std::shared_ptr<const ImageDocument> image_;
+    juce::String imageMessage_;
+    /** Jobs refer to media members, so the destructor waits for them. */
+    juce::ThreadPool mediaLoader_ {1};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HolotonerProcessor)
 };

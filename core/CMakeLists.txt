@@ -1,7 +1,8 @@
 add_library(holotoner_core STATIC
     audio/SourcePlayer.cpp
     dsp/StereoWidth.cpp
-    geometry/PlaneProjection.cpp)
+    geometry/PlaneProjection.cpp
+    image/ImageMask.cpp)
 
 target_include_directories(holotoner_core PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(holotoner_core PUBLIC cxx_std_20)

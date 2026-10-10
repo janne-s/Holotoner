@@ -22,18 +22,21 @@ repository. Public documentation belongs here.
 
 ## Current development foundation
 
-The portable core currently establishes three invariants:
+The portable core currently establishes four invariants:
 
 1. one canonical three-axis plane projection for future native and web views;
 2. a smoothed signed mid/side baseline driven by that projection: a centred
    plane at 90 degrees yaw is mono, 180 degrees reverses the side channel and
    horizontal position balances the processed result;
 3. an allocation-free test-source player that resamples and seamlessly loops
-   immutable audio loaded away from the audio thread.
+   immutable audio loaded away from the audio thread;
+4. deterministic RGBA-to-mask analysis for Off, luma, alpha and individual
+   colour channels, including bounded gain, fill, normalize, invert and amount
+   behavior that preserves transparency.
 
-This is foundation work, not a released feature set. Image import, the final
-spectral mono-to-stereo path, direct-manipulation UI, the full polar analyser,
-the web application and release verification must be complete before the first
+This is foundation work, not a released feature set. The final spectral
+mono-to-stereo path, selectable image modulation, the full polar analyser, the
+web application and release verification must be complete before the first
 release.
 
 ## Build the core and tests
@@ -64,8 +67,10 @@ off-thread file loader, host-transport-aware playback and common source
 controls. Its editor establishes the side-by-side interaction: an automatable
 plane panel controls the canonical transform, while a read-only polar panel
 shows the same projection, input/output level and output correlation. Image
-import, spectral analysis and image-dependent audio processing are not yet
-implemented, so this is not a Holotoner release.
+import accepts PNG, JPEG and GIF away from the audio thread, bounds and
+normalizes the image, embeds it in session state, and shows its luma projection
+in both panels. Spectral analysis and image-dependent audio processing are not
+yet implemented, so this is not a Holotoner release.
 
 ## Licence
 

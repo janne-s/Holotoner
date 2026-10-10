@@ -2,6 +2,7 @@
 #include "core/audio/SourcePlayer.h"
 #include "core/dsp/StereoWidth.h"
 #include "core/geometry/PlaneProjection.h"
+#include "core/image/ImageMask.h"
 
 #include <algorithm>
 #include <array>
@@ -243,6 +244,48 @@ void sharedExchangeRetiresOffAudioPath()
     }
 }
 
+void imageMaskIsDeterministic()
+{
+    holotoner::ImageMaskSettings settings;
+    settings.channel = holotoner::PixelChannel::Luma;
+    const auto empty = holotoner::buildImageMask({}, settings);
+    for (const auto value : empty.values)
+        expectNear(value, 0.0f, 0.0f, "invalid image produces an empty mask");
+
+    holotoner::RgbaImage image;
+    image.width = 2;
+    image.height = 2;
+    image.pixels = {
+        255, 0, 0, 255,   0, 255, 0, 255,
+        0, 0, 255, 255,   255, 255, 255, 0,
+    };
+
+    settings.channel = holotoner::PixelChannel::Red;
+    auto mask = holotoner::buildImageMask(image, settings);
+    expectNear(mask.at(0, 0), 1.0f, 1.0e-6f, "red mask reads red");
+    expectNear(mask.at(63, 0), 0.0f, 1.0e-6f, "red mask rejects green");
+    expectNear(mask.at(63, 63), 0.0f, 1.0e-6f, "transparent pixel stays empty");
+
+    settings.fill = 0.4f;
+    mask = holotoner::buildImageMask(image, settings);
+    expectNear(mask.at(63, 0), 0.4f, 1.0e-6f, "fill raises opaque pixel");
+    expectNear(mask.at(63, 63), 0.0f, 1.0e-6f, "fill never fills transparency");
+
+    settings = {};
+    settings.channel = holotoner::PixelChannel::Luma;
+    settings.normalize = true;
+    settings.invert = true;
+    settings.amount = 0.5f;
+    mask = holotoner::buildImageMask(image, settings);
+    expectNear(mask.at(63, 63), 0.0f, 1.0e-6f, "normalized invert preserves transparency");
+    for (const auto value : mask.values)
+        if (!std::isfinite(value) || value < 0.0f || value > 0.5f) {
+            std::cerr << "image mask escaped bounds\n";
+            ++failures;
+            break;
+        }
+}
+
 } // namespace
 
 int main()
@@ -256,6 +299,7 @@ int main()
     invalidValuesAreContained();
     sourcePlayerIsDeterministic();
     sharedExchangeRetiresOffAudioPath();
+    imageMaskIsDeterministic();
     if (failures != 0)
         std::cerr << failures << " test assertion(s) failed\n";
     return failures == 0 ? 0 : 1;

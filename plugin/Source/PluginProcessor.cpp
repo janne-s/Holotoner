@@ -9,7 +9,9 @@
 
 namespace {
 
-constexpr int kStateVersion = 1;
+constexpr int kStateVersion = 2;
+constexpr juce::int64 kMaximumImageFileBytes = 32 * 1024 * 1024;
+constexpr int kMaximumImageDimension = 1024;
 
 juce::String sourceKindKey(holotoner::SourceKind kind)
 {
@@ -86,7 +88,7 @@ HolotonerProcessor::HolotonerProcessor()
 HolotonerProcessor::~HolotonerProcessor()
 {
     stopTimer();
-    sourceLoader_.removeAllJobs(true, 5000);
+    mediaLoader_.removeAllJobs(true, 5000);
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::parameterLayout()
@@ -229,6 +231,11 @@ void HolotonerProcessor::getStateInformation(juce::MemoryBlock& destination)
             std::lock_guard lock(sourceInfoMutex_);
             source->setAttribute("path", sourceFile_.getFullPathName());
         }
+        if (const auto image = imageDocument()) {
+            auto* imageState = xml->createNewChildElement("Image");
+            imageState->setAttribute("name", image->name);
+            imageState->addTextElement(image->normalizedPng.toBase64Encoding());
+        }
         copyXmlToBinary(*xml, destination);
     }
 }
@@ -240,23 +247,52 @@ void HolotonerProcessor::setStateInformation(const void* data, int sizeInBytes)
         return;
     auto sourceKindToRestore = holotoner::SourceKind::Input;
     juce::File sourceFileToRestore;
+    juce::MemoryBlock imageToRestore;
+    juce::String imageNameToRestore;
     if (auto* source = xml->getChildByName("Source")) {
         sourceKindToRestore = sourceKindFromKey(source->getStringAttribute("kind"));
         sourceFileToRestore = juce::File(source->getStringAttribute("path"));
         xml->removeChildElement(source, true);
+    }
+    if (auto* image = xml->getChildByName("Image")) {
+        imageNameToRestore = image->getStringAttribute("name");
+        imageToRestore.fromBase64Encoding(image->getAllSubText());
+        xml->removeChildElement(image, true);
     }
     const auto state = juce::ValueTree::fromXml(*xml);
     const auto version = static_cast<int>(state.getProperty("format_version", 0));
     if (version == kStateVersion) {
         parameters_.replaceState(state);
         const bool fileExists = sourceFileToRestore.existsAsFile();
-        setSourceKind(sourceKindToRestore == holotoner::SourceKind::File && !fileExists
-                          ? holotoner::SourceKind::Input
-                          : sourceKindToRestore);
-        if (fileExists)
-            loadSourceFile(sourceFileToRestore, false);
-        else if (sourceFileToRestore != juce::File())
+        {
+            std::lock_guard lock(sourceInfoMutex_);
+            sourceFile_ = sourceFileToRestore;
+        }
+        if (sourceKindToRestore == holotoner::SourceKind::File) {
+            setSourceKind(holotoner::SourceKind::Input);
+            if (fileExists)
+                loadSourceFile(sourceFileToRestore, true);
+        } else {
+            setSourceKind(sourceKindToRestore);
+            if (fileExists)
+                loadSourceFile(sourceFileToRestore, false);
+        }
+        if (!fileExists && sourceFileToRestore != juce::File())
             setSourceMessage("Not found: " + sourceFileToRestore.getFullPathName());
+
+        const auto imageRequest = imageRequest_.fetch_add(1) + 1;
+        {
+            std::lock_guard lock(imageMutex_);
+            image_.reset();
+            imageMessage_.clear();
+        }
+        if (!imageToRestore.isEmpty()) {
+            imageLoadsPending_.fetch_add(1);
+            mediaLoader_.addJob([this, imageBytes = std::move(imageToRestore), name = std::move(imageNameToRestore), imageRequest]() mutable {
+                loadImageData(std::move(imageBytes), std::move(name), imageRequest);
+                imageLoadsPending_.fetch_sub(1);
+            });
+        }
     }
 }
 
@@ -268,7 +304,7 @@ bool HolotonerProcessor::isSupportedAudioFile(const juce::File& file)
 void HolotonerProcessor::loadSourceFile(const juce::File& file, bool switchToFile)
 {
     sourceLoadsPending_.fetch_add(1);
-    sourceLoader_.addJob([this, file, switchToFile] {
+    mediaLoader_.addJob([this, file, switchToFile] {
         juce::AudioFormatManager formats;
         formats.registerBasicFormats();
         std::unique_ptr<juce::AudioFormatReader> reader(formats.createReaderFor(file));
@@ -324,5 +360,107 @@ void HolotonerProcessor::setSourceMessage(const juce::String& message)
 }
 
 void HolotonerProcessor::timerCallback() { sources_.collectGarbage(); }
+
+bool HolotonerProcessor::isSupportedImageFile(const juce::File& file)
+{
+    return file.hasFileExtension("png;jpg;jpeg;gif");
+}
+
+void HolotonerProcessor::loadImageFile(const juce::File& file)
+{
+    const auto request = imageRequest_.fetch_add(1) + 1;
+    imageLoadsPending_.fetch_add(1);
+    mediaLoader_.addJob([this, file, request] {
+        juce::String message;
+        if (!file.existsAsFile() || file.getSize() <= 0 || file.getSize() > kMaximumImageFileBytes) {
+            message = "Cannot read image " + file.getFileName();
+        } else {
+            juce::MemoryBlock data;
+            if (!file.loadFileAsData(data))
+                message = "Cannot read image " + file.getFileName();
+            else {
+                loadImageData(std::move(data), file.getFileName(), request);
+                imageLoadsPending_.fetch_sub(1);
+                return;
+            }
+        }
+        if (request == imageRequest_.load())
+            setImageMessage(message);
+        imageLoadsPending_.fetch_sub(1);
+    });
+}
+
+void HolotonerProcessor::loadImageData(juce::MemoryBlock data, juce::String name, std::uint64_t request)
+{
+    auto decoded = juce::ImageFileFormat::loadFrom(data.getData(), data.getSize());
+    if (decoded.isNull()) {
+        if (request == imageRequest_.load())
+            setImageMessage("Cannot decode image " + name);
+        return;
+    }
+
+    const auto largest = std::max(decoded.getWidth(), decoded.getHeight());
+    if (largest > kMaximumImageDimension) {
+        const auto scale = static_cast<double>(kMaximumImageDimension) / static_cast<double>(largest);
+        decoded = decoded.rescaled(std::max(1, juce::roundToInt(scale * decoded.getWidth())),
+                                   std::max(1, juce::roundToInt(scale * decoded.getHeight())),
+                                   juce::Graphics::highResamplingQuality);
+    }
+    decoded = decoded.convertedToFormat(juce::Image::ARGB);
+
+    holotoner::RgbaImage rgba;
+    rgba.width = decoded.getWidth();
+    rgba.height = decoded.getHeight();
+    rgba.pixels.resize(static_cast<std::size_t>(rgba.width) * static_cast<std::size_t>(rgba.height) * 4);
+    const juce::Image::BitmapData pixels(decoded, juce::Image::BitmapData::readOnly);
+    for (int y = 0; y < rgba.height; ++y)
+        for (int x = 0; x < rgba.width; ++x) {
+            const auto colour = pixels.getPixelColour(x, y);
+            const auto offset = static_cast<std::size_t>((y * rgba.width + x) * 4);
+            rgba.pixels[offset] = colour.getRed();
+            rgba.pixels[offset + 1] = colour.getGreen();
+            rgba.pixels[offset + 2] = colour.getBlue();
+            rgba.pixels[offset + 3] = colour.getAlpha();
+        }
+
+    holotoner::ImageMaskSettings maskSettings;
+    maskSettings.channel = holotoner::PixelChannel::Luma;
+    auto document = std::make_shared<ImageDocument>();
+    document->image = decoded;
+    document->name = std::move(name);
+    document->lumaMask = holotoner::buildImageMask(rgba, maskSettings);
+    juce::MemoryOutputStream encoded(document->normalizedPng, false);
+    juce::PNGImageFormat png;
+    if (!png.writeImageToStream(decoded, encoded)) {
+        if (request == imageRequest_.load())
+            setImageMessage("Cannot normalize image " + document->name);
+        return;
+    }
+    if (request != imageRequest_.load())
+        return;
+    {
+        std::lock_guard lock(imageMutex_);
+        image_ = std::move(document);
+        imageMessage_.clear();
+    }
+}
+
+std::shared_ptr<const HolotonerProcessor::ImageDocument> HolotonerProcessor::imageDocument() const
+{
+    std::lock_guard lock(imageMutex_);
+    return image_;
+}
+
+juce::String HolotonerProcessor::lastImageMessage() const
+{
+    std::lock_guard lock(imageMutex_);
+    return imageMessage_;
+}
+
+void HolotonerProcessor::setImageMessage(const juce::String& message)
+{
+    std::lock_guard lock(imageMutex_);
+    imageMessage_ = message;
+}
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new HolotonerProcessor(); }

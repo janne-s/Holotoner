@@ -29,6 +29,7 @@ private:
 
     void timerCallback() override;
     void chooseAudioFile();
+    void chooseImageFile();
     void resetTransform();
     void refresh();
 
@@ -41,12 +42,14 @@ private:
     juce::TextButton loadAudio_ {"Audio..."};
     juce::TextButton restart_ {"Restart"};
     juce::TextButton play_ {"Stop"};
+    juce::TextButton loadImage_ {"Image..."};
     juce::TextButton reset_ {"Reset plane"};
     juce::Label wetLabel_;
     juce::Slider wet_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> wetAttachment_;
     juce::Label status_;
     std::unique_ptr<juce::FileChooser> chooser_;
+    std::shared_ptr<const HolotonerProcessor::ImageDocument> currentImage_;
     bool dragOver_ = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HolotonerEditor)
