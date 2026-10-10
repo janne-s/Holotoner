@@ -17,8 +17,12 @@ juce_add_plugin(Holotoner
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
 target_sources(Holotoner PRIVATE
+    Source/PluginEditor.cpp
+    Source/PluginEditor.h
     Source/PluginProcessor.cpp
-    Source/PluginProcessor.h)
+    Source/PluginProcessor.h
+    Source/Style.cpp
+    Source/Style.h)
 
 target_compile_definitions(Holotoner PUBLIC
     JUCE_WEB_BROWSER=0

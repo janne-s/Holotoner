@@ -25,15 +25,16 @@ repository. Public documentation belongs here.
 The portable core currently establishes three invariants:
 
 1. one canonical three-axis plane projection for future native and web views;
-2. a smoothed signed mid/side baseline where a centred plane at 90 degrees yaw
-   is mono and 180 degrees reverses the side channel;
+2. a smoothed signed mid/side baseline driven by that projection: a centred
+   plane at 90 degrees yaw is mono, 180 degrees reverses the side channel and
+   horizontal position balances the processed result;
 3. an allocation-free test-source player that resamples and seamlessly loops
    immutable audio loaded away from the audio thread.
 
 This is foundation work, not a released feature set. Image import, the final
 spectral mono-to-stereo path, direct-manipulation UI, the full polar analyser,
-the Standalone source controls and the web application must be complete before
-the first release.
+the web application and release verification must be complete before the first
+release.
 
 ## Build the core and tests
 
@@ -57,11 +58,14 @@ cmake -S . -B build-native -DCMAKE_BUILD_TYPE=Release
 cmake --build build-native --parallel
 ```
 
-The current JUCE wrapper is intentionally a development shell around the tested
-baseline. Its Standalone target starts with a test click, and the processor has
-the off-thread file-loader and host-transport-aware playback path. The source
-controls and the agreed two-panel editor are the next development stage; this
-is not yet a Holotoner release.
+The current JUCE wrapper is an unreleased development build around the tested
+baseline. Its Standalone target starts with a test click and supports an
+off-thread file loader, host-transport-aware playback and common source
+controls. Its editor establishes the side-by-side interaction: an automatable
+plane panel controls the canonical transform, while a read-only polar panel
+shows the same projection, input/output level and output correlation. Image
+import, spectral analysis and image-dependent audio processing are not yet
+implemented, so this is not a Holotoner release.
 
 ## Licence
 

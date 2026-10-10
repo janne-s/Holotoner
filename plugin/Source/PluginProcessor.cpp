@@ -1,6 +1,11 @@
 #include "PluginProcessor.h"
+#include "PluginEditor.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
+
+#include <algorithm>
+#include <cmath>
+#include <memory>
 
 namespace {
 
@@ -28,6 +33,33 @@ holotoner::SourceKind sourceKindFromKey(const juce::String& key)
     return holotoner::SourceKind::Input;
 }
 
+struct BlockMeter {
+    float left = 0.0f;
+    float right = 0.0f;
+    float correlation = 0.0f;
+};
+
+BlockMeter measureBlock(const float* left, const float* right, int samples)
+{
+    if (left == nullptr || right == nullptr || samples <= 0)
+        return {};
+    double leftSquare = 0.0;
+    double rightSquare = 0.0;
+    double cross = 0.0;
+    for (int i = 0; i < samples; ++i) {
+        const auto l = std::isfinite(left[i]) ? static_cast<double>(left[i]) : 0.0;
+        const auto r = std::isfinite(right[i]) ? static_cast<double>(right[i]) : 0.0;
+        leftSquare += l * l;
+        rightSquare += r * r;
+        cross += l * r;
+    }
+    const auto count = static_cast<double>(samples);
+    const auto denominator = std::sqrt(leftSquare * rightSquare);
+    return {static_cast<float>(std::sqrt(leftSquare / count)),
+            static_cast<float>(std::sqrt(rightSquare / count)),
+            denominator > 1.0e-20 ? static_cast<float>(std::clamp(cross / denominator, -1.0, 1.0)) : 0.0f};
+}
+
 } // namespace
 
 HolotonerProcessor::HolotonerProcessor()
@@ -36,10 +68,16 @@ HolotonerProcessor::HolotonerProcessor()
                          .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       parameters_(*this, nullptr, "HolotonerState", parameterLayout())
 {
+    positionX_ = parameters_.getRawParameterValue("position_x");
+    positionY_ = parameters_.getRawParameterValue("position_y");
+    scaleX_ = parameters_.getRawParameterValue("scale_x");
+    scaleY_ = parameters_.getRawParameterValue("scale_y");
+    pitch_ = parameters_.getRawParameterValue("pitch");
     yaw_ = parameters_.getRawParameterValue("yaw");
-    width_ = parameters_.getRawParameterValue("width");
+    roll_ = parameters_.getRawParameterValue("roll");
     wet_ = parameters_.getRawParameterValue("wet");
-    jassert(yaw_ != nullptr && width_ != nullptr && wet_ != nullptr);
+    jassert(positionX_ != nullptr && positionY_ != nullptr && scaleX_ != nullptr && scaleY_ != nullptr
+            && pitch_ != nullptr && yaw_ != nullptr && roll_ != nullptr && wet_ != nullptr);
     if (wrapperType == wrapperType_Standalone)
         setSourceKind(holotoner::SourceKind::Clicks);
     startTimer(250);
@@ -54,24 +92,47 @@ HolotonerProcessor::~HolotonerProcessor()
 juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::parameterLayout()
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
+    const auto normalized = juce::NormalisableRange<float> {-1.0f, 1.0f, 0.001f};
+    const auto degrees = juce::NormalisableRange<float> {-180.0f, 180.0f, 0.01f};
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID {"yaw", 1}, "Yaw", juce::NormalisableRange<float> {-180.0f, 180.0f, 0.01f}, 0.0f,
+        juce::ParameterID {"position_x", 1}, "Position X", normalized, 0.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"position_y", 1}, "Position Y", normalized, 0.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"scale_x", 1}, "Scale X", juce::NormalisableRange<float> {0.05f, 2.0f, 0.001f}, 1.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"scale_y", 1}, "Scale Y", juce::NormalisableRange<float> {0.05f, 2.0f, 0.001f}, 1.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"pitch", 1}, "Pitch", degrees, 0.0f,
         juce::AudioParameterFloatAttributes().withLabel("deg")));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID {"width", 1}, "Width", juce::NormalisableRange<float> {0.0f, 2.0f, 0.001f}, 1.0f));
+        juce::ParameterID {"yaw", 1}, "Yaw", degrees, 0.0f,
+        juce::AudioParameterFloatAttributes().withLabel("deg")));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"roll", 1}, "Roll", degrees, 0.0f,
+        juce::AudioParameterFloatAttributes().withLabel("deg")));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID {"wet", 1}, "Wet", juce::NormalisableRange<float> {0.0f, 1.0f, 0.001f}, 1.0f,
-        juce::AudioParameterFloatAttributes().withLabel("%")));
+        juce::AudioParameterFloatAttributes()
+            .withLabel("%")
+            .withStringFromValueFunction([](float value, int) { return juce::String(100.0f * value, 0); })
+            .withValueFromStringFunction([](const juce::String& text) { return 0.01f * text.getFloatValue(); })));
     return layout;
 }
 
 void HolotonerProcessor::prepareToPlay(double sampleRate, int)
 {
     engine_.prepare(sampleRate);
-    engine_.setParameters({yaw_->load(std::memory_order_relaxed), width_->load(std::memory_order_relaxed),
-                           wet_->load(std::memory_order_relaxed)});
+    engine_.setParameters({planeTransform(), wet_->load(std::memory_order_relaxed)});
     engine_.reset();
     sourcePlayer_.prepare(sampleRate);
+    meterInputLeft_ = meterInputRight_ = meterOutputLeft_ = meterOutputRight_ = 0.0f;
+    meterDecayPerSample_ = static_cast<float>(std::exp(-1.0 / (std::max(1.0, sampleRate) * 0.35)));
+    inputLeft_.store(0.0f, std::memory_order_relaxed);
+    inputRight_.store(0.0f, std::memory_order_relaxed);
+    outputLeft_.store(0.0f, std::memory_order_relaxed);
+    outputRight_.store(0.0f, std::memory_order_relaxed);
+    outputCorrelation_.store(0.0f, std::memory_order_relaxed);
 }
 
 bool HolotonerProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -119,16 +180,42 @@ void HolotonerProcessor::processBlock(juce::AudioBuffer<float>& audio, juce::Mid
         audio.clear(1, 0, samples);
     }
 
-    engine_.setParameters({yaw_->load(std::memory_order_relaxed), width_->load(std::memory_order_relaxed),
-                           wet_->load(std::memory_order_relaxed)});
+    const auto inputMeter = measureBlock(audio.getReadPointer(0), audio.getReadPointer(1), samples);
+    const auto meterDecay = std::pow(meterDecayPerSample_, static_cast<float>(samples));
+    meterInputLeft_ = std::max(inputMeter.left, meterInputLeft_ * meterDecay);
+    meterInputRight_ = std::max(inputMeter.right, meterInputRight_ * meterDecay);
+    inputLeft_.store(meterInputLeft_, std::memory_order_relaxed);
+    inputRight_.store(meterInputRight_, std::memory_order_relaxed);
+
+    engine_.setParameters({planeTransform(), wet_->load(std::memory_order_relaxed)});
     engine_.process(audio.getWritePointer(0), audio.getWritePointer(1), samples);
+    const auto outputMeter = measureBlock(audio.getReadPointer(0), audio.getReadPointer(1), samples);
+    meterOutputLeft_ = std::max(outputMeter.left, meterOutputLeft_ * meterDecay);
+    meterOutputRight_ = std::max(outputMeter.right, meterOutputRight_ * meterDecay);
+    outputLeft_.store(meterOutputLeft_, std::memory_order_relaxed);
+    outputRight_.store(meterOutputRight_, std::memory_order_relaxed);
+    if (outputMeter.left + outputMeter.right > 1.0e-7f)
+        outputCorrelation_.store(outputMeter.correlation, std::memory_order_relaxed);
+}
+
+holotoner::PlaneTransform HolotonerProcessor::planeTransform() const
+{
+    return {positionX_->load(std::memory_order_relaxed), positionY_->load(std::memory_order_relaxed),
+            scaleX_->load(std::memory_order_relaxed), scaleY_->load(std::memory_order_relaxed),
+            pitch_->load(std::memory_order_relaxed), yaw_->load(std::memory_order_relaxed),
+            roll_->load(std::memory_order_relaxed)};
+}
+
+HolotonerProcessor::MeterState HolotonerProcessor::meterState() const
+{
+    return {inputLeft_.load(std::memory_order_relaxed), inputRight_.load(std::memory_order_relaxed),
+            outputLeft_.load(std::memory_order_relaxed), outputRight_.load(std::memory_order_relaxed),
+            outputCorrelation_.load(std::memory_order_relaxed)};
 }
 
 juce::AudioProcessorEditor* HolotonerProcessor::createEditor()
 {
-    // The generic editor keeps this unreleased wrapper inspectable without
-    // pretending that the agreed two-panel production editor already exists.
-    return new juce::GenericAudioProcessorEditor(*this);
+    return new HolotonerEditor(*this);
 }
 
 void HolotonerProcessor::getStateInformation(juce::MemoryBlock& destination)

@@ -18,6 +18,14 @@
  */
 class HolotonerProcessor final : public juce::AudioProcessor, private juce::Timer {
 public:
+    struct MeterState {
+        float inputLeft = 0.0f;
+        float inputRight = 0.0f;
+        float outputLeft = 0.0f;
+        float outputRight = 0.0f;
+        float outputCorrelation = 0.0f;
+    };
+
     HolotonerProcessor();
     ~HolotonerProcessor() override;
 
@@ -45,6 +53,8 @@ public:
     void setStateInformation(const void* data, int sizeInBytes) override;
 
     juce::AudioProcessorValueTreeState& state() { return parameters_; }
+    holotoner::PlaneTransform planeTransform() const;
+    MeterState meterState() const;
 
     void setSourceKind(holotoner::SourceKind kind) { sourceKind_.store(static_cast<int>(kind)); }
     holotoner::SourceKind sourceKind() const
@@ -69,10 +79,25 @@ private:
     void setSourceMessage(const juce::String& message);
 
     juce::AudioProcessorValueTreeState parameters_;
+    std::atomic<float>* positionX_ = nullptr;
+    std::atomic<float>* positionY_ = nullptr;
+    std::atomic<float>* scaleX_ = nullptr;
+    std::atomic<float>* scaleY_ = nullptr;
+    std::atomic<float>* pitch_ = nullptr;
     std::atomic<float>* yaw_ = nullptr;
-    std::atomic<float>* width_ = nullptr;
+    std::atomic<float>* roll_ = nullptr;
     std::atomic<float>* wet_ = nullptr;
     holotoner::StereoWidth engine_;
+    std::atomic<float> inputLeft_ {0.0f};
+    std::atomic<float> inputRight_ {0.0f};
+    std::atomic<float> outputLeft_ {0.0f};
+    std::atomic<float> outputRight_ {0.0f};
+    std::atomic<float> outputCorrelation_ {0.0f};
+    float meterInputLeft_ = 0.0f;       ///< audio thread
+    float meterInputRight_ = 0.0f;      ///< audio thread
+    float meterOutputLeft_ = 0.0f;      ///< audio thread
+    float meterOutputRight_ = 0.0f;     ///< audio thread
+    float meterDecayPerSample_ = 0.0f;  ///< audio thread
 
     holotoner::SourcePlayer sourcePlayer_;
     holotoner::SharedExchange<holotoner::SourceAudio> sources_;

@@ -63,7 +63,9 @@ void stereoEndpoints(double sampleRate)
 
     std::array<float, 4> left {1.0f, 0.5f, -0.25f, -1.0f};
     std::array<float, 4> right {-1.0f, -0.5f, 0.25f, 1.0f};
-    engine.setParameters({90.0f, 1.0f, 1.0f});
+    holotoner::StereoWidth::Parameters parameters;
+    parameters.plane.yawDegrees = 90.0f;
+    engine.setParameters(parameters);
     engine.process(left.data(), right.data(), static_cast<int>(left.size()));
     for (std::size_t i = 0; i < left.size(); ++i) {
         expectNear(left[i], 0.0f, 1.0e-5f, "edge left is mono mid");
@@ -72,10 +74,20 @@ void stereoEndpoints(double sampleRate)
 
     left = {1.0f, 0.5f, -0.25f, -1.0f};
     right = {-1.0f, -0.5f, 0.25f, 1.0f};
-    engine.setParameters({180.0f, 1.0f, 1.0f});
+    parameters.plane.yawDegrees = 180.0f;
+    engine.setParameters(parameters);
     engine.process(left.data(), right.data(), static_cast<int>(left.size()));
     expectNear(left[0], -1.0f, 1.0e-6f, "back left");
     expectNear(right[0], 1.0f, 1.0e-6f, "back right");
+
+    parameters = {};
+    parameters.plane.positionX = 1.0f;
+    engine.setParameters(parameters);
+    left = {0.5f, 0.5f, 0.5f, 0.5f};
+    right = left;
+    engine.process(left.data(), right.data(), static_cast<int>(left.size()));
+    expectNear(left[0], 0.0f, 1.0e-6f, "right position removes left wet channel");
+    expectNear(right[0], 0.5f, 1.0e-6f, "right position keeps right wet channel");
 }
 
 void blockPartitionIsIndependent()
@@ -94,7 +106,11 @@ void blockPartitionIsIndependent()
     holotoner::StereoWidth split;
     whole.prepare(48000.0, 20.0);
     split.prepare(48000.0, 20.0);
-    const holotoner::StereoWidth::Parameters target {173.0f, 1.7f, 0.83f};
+    holotoner::StereoWidth::Parameters target;
+    target.plane.positionX = 0.35f;
+    target.plane.scaleX = 1.7f;
+    target.plane.yawDegrees = 173.0f;
+    target.wet = 0.83f;
     whole.setParameters(target);
     split.setParameters(target);
     whole.process(wholeLeft.data(), wholeRight.data(), static_cast<int>(count));
@@ -121,7 +137,11 @@ void dryIsExact()
 {
     holotoner::StereoWidth engine;
     engine.prepare(44100.0, 0.0);
-    engine.setParameters({137.0f, 2.0f, 0.0f});
+    holotoner::StereoWidth::Parameters parameters;
+    parameters.plane.yawDegrees = 137.0f;
+    parameters.plane.scaleX = 2.0f;
+    parameters.wet = 0.0f;
+    engine.setParameters(parameters);
     std::array<float, 3> left {0.2f, -0.4f, 0.9f};
     std::array<float, 3> right {-0.7f, 0.3f, 0.1f};
     const auto originalLeft = left;
@@ -138,7 +158,12 @@ void invalidValuesAreContained()
     holotoner::StereoWidth engine;
     engine.prepare(48000.0, 0.0);
     const auto nan = std::numeric_limits<float>::quiet_NaN();
-    engine.setParameters({nan, nan, nan});
+    holotoner::StereoWidth::Parameters parameters;
+    parameters.plane.positionX = nan;
+    parameters.plane.scaleX = nan;
+    parameters.plane.yawDegrees = nan;
+    parameters.wet = nan;
+    engine.setParameters(parameters);
     std::array<float, 2> left {nan, std::numeric_limits<float>::max()};
     std::array<float, 2> right {0.25f, -std::numeric_limits<float>::max()};
     engine.process(left.data(), right.data(), static_cast<int>(left.size()));

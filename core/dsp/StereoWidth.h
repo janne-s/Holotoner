@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/geometry/PlaneProjection.h"
+
 #include <cstdint>
 
 namespace holotoner {
@@ -9,15 +11,15 @@ namespace holotoner {
  *
  * This stage establishes the orientation invariant used by the later spectral
  * engine. It preserves the input mid channel and scales its side channel by
- * width * cos(yaw). At full Wet, 90 degrees is mono and 180 degrees reverses
- * left and right. The final image-driven engine will add a bounded
- * mono-to-stereo path before the first release.
+ * the canonical plane's signed projected width. Horizontal position balances
+ * the processed result left or right. At full Wet, a centred plane at 90
+ * degrees yaw is mono and 180 degrees reverses left and right. The final
+ * image-driven engine will add a bounded mono-to-stereo path before release.
  */
 class StereoWidth {
 public:
     struct Parameters {
-        float yawDegrees = 0.0f;
-        float width = 1.0f;
+        PlaneTransform plane;
         float wet = 1.0f;
     };
 
@@ -44,6 +46,7 @@ private:
     };
 
     Ramp signedWidth_;
+    Ramp positionX_;
     Ramp wet_;
     Parameters parameters_;
     std::uint32_t safetyResets_ = 0;

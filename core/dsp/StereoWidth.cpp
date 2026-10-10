@@ -6,14 +6,13 @@
 namespace holotoner {
 namespace {
 
-constexpr float kPi = 3.14159265358979323846f;
-
 float finiteOr(float value, float fallback) { return std::isfinite(value) ? value : fallback; }
 
 float signedWidth(const StereoWidth::Parameters& parameters)
 {
-    const auto yawRadians = std::clamp(parameters.yawDegrees, -180.0f, 180.0f) * kPi / 180.0f;
-    return std::clamp(parameters.width, 0.0f, 2.0f) * std::cos(yawRadians);
+    const auto projection = projectPlane(parameters.plane);
+    const auto magnitude = std::clamp(0.5f * projection.stereoSpan, 0.0f, 2.0f);
+    return projection.signedFacing < 0.0f ? -magnitude : magnitude;
 }
 
 } // namespace
@@ -62,8 +61,10 @@ void StereoWidth::prepare(double sampleRate, double smoothingMilliseconds)
     const auto seconds = std::max(0.0, smoothingMilliseconds) * 0.001;
     const auto smoothingSamples = static_cast<int>(std::ceil(std::max(1.0, sampleRate) * seconds));
     signedWidth_.prepare(smoothingSamples);
+    positionX_.prepare(smoothingSamples);
     wet_.prepare(smoothingSamples);
     signedWidth_.reset(signedWidth(parameters_));
+    positionX_.reset(std::clamp(parameters_.plane.positionX, -1.0f, 1.0f));
     wet_.reset(std::clamp(parameters_.wet, 0.0f, 1.0f));
     prepared_ = true;
 }
@@ -71,22 +72,28 @@ void StereoWidth::prepare(double sampleRate, double smoothingMilliseconds)
 void StereoWidth::reset()
 {
     signedWidth_.reset(signedWidth(parameters_));
+    positionX_.reset(std::clamp(parameters_.plane.positionX, -1.0f, 1.0f));
     wet_.reset(std::clamp(parameters_.wet, 0.0f, 1.0f));
     safetyResets_ = 0;
 }
 
 void StereoWidth::setParameters(Parameters parameters)
 {
-    parameters.yawDegrees = finiteOr(parameters.yawDegrees, 0.0f);
-    parameters.width = finiteOr(parameters.width, 1.0f);
+    auto& plane = parameters.plane;
+    plane.positionX = std::clamp(finiteOr(plane.positionX, 0.0f), -1.0f, 1.0f);
+    plane.positionY = std::clamp(finiteOr(plane.positionY, 0.0f), -1.0f, 1.0f);
+    plane.scaleX = std::clamp(finiteOr(plane.scaleX, 1.0f), 0.0f, 2.0f);
+    plane.scaleY = std::clamp(finiteOr(plane.scaleY, 1.0f), 0.0f, 2.0f);
+    plane.pitchDegrees = std::clamp(finiteOr(plane.pitchDegrees, 0.0f), -180.0f, 180.0f);
+    plane.yawDegrees = std::clamp(finiteOr(plane.yawDegrees, 0.0f), -180.0f, 180.0f);
+    plane.rollDegrees = std::clamp(finiteOr(plane.rollDegrees, 0.0f), -180.0f, 180.0f);
     parameters.wet = finiteOr(parameters.wet, 1.0f);
-    parameters.yawDegrees = std::clamp(parameters.yawDegrees, -180.0f, 180.0f);
-    parameters.width = std::clamp(parameters.width, 0.0f, 2.0f);
     parameters.wet = std::clamp(parameters.wet, 0.0f, 1.0f);
     parameters_ = parameters;
 
     if (prepared_) {
         signedWidth_.set(signedWidth(parameters_));
+        positionX_.set(parameters_.plane.positionX);
         wet_.set(parameters_.wet);
     }
 }
@@ -104,9 +111,12 @@ void StereoWidth::process(float* left, float* right, int sampleCount)
         const auto mid = 0.5f * (dryLeft + dryRight);
         const auto side = 0.5f * (dryLeft - dryRight);
         const auto width = signedWidth_.next();
+        const auto position = positionX_.next();
         const auto wet = wet_.next();
-        const auto wetLeft = mid + width * side;
-        const auto wetRight = mid - width * side;
+        const auto leftBalance = 1.0f - std::max(0.0f, position);
+        const auto rightBalance = 1.0f + std::min(0.0f, position);
+        const auto wetLeft = (mid + width * side) * leftBalance;
+        const auto wetRight = (mid - width * side) * rightBalance;
         const auto outputLeft = dryLeft + wet * (wetLeft - dryLeft);
         const auto outputRight = dryRight + wet * (wetRight - dryRight);
         if (std::isfinite(outputLeft) && std::isfinite(outputRight)) {
