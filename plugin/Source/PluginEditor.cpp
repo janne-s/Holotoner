@@ -42,15 +42,6 @@ void endParameter(HolotonerProcessor& processor, const char* id)
         target->endChangeGesture();
 }
 
-juce::Point<float> polarPoint(juce::Point<float> centre, float maximumRadius,
-                              const holotoner::ProjectedPoint& point)
-{
-    const auto stereo = clamp(point.stereo, -2.0f, 2.0f) * 0.5f;
-    const auto frequency = 0.25f + 0.7f * ((clamp(point.frequency, -2.0f, 2.0f) + 2.0f) * 0.25f);
-    const auto angle = (-90.0f + 60.0f * stereo) * pi / 180.0f;
-    const auto radius = maximumRadius * frequency;
-    return {centre.x + radius * std::cos(angle), centre.y + radius * std::sin(angle)};
-}
 
 } // namespace
 
@@ -61,9 +52,20 @@ public:
         setMouseCursor(juce::MouseCursor::DraggingHandCursor);
     }
 
-    void setImage(juce::Image image)
+    void setMask(const holotoner::ImageMask* mask)
     {
-        image_ = std::move(image);
+        if (mask == nullptr || !mask->hasSource) {
+            image_ = {};
+            return;
+        }
+        image_ = juce::Image(juce::Image::RGB, holotoner::kImageMaskWidth, holotoner::kImageMaskHeight, false);
+        aspectX_ = mask->aspectX;
+        aspectY_ = mask->aspectY;
+        for (int y = 0; y < holotoner::kImageMaskHeight; ++y)
+            for (int x = 0; x < holotoner::kImageMaskWidth; ++x) {
+                const auto value = juce::jlimit(0.0f, 1.0f, mask->at(x, y));
+                image_.setPixelAt(x, y, juce::Colour::fromFloatRGBA(value, value, value, 1.0f));
+            }
         repaint();
     }
 
@@ -135,7 +137,7 @@ public:
 
         graphics.setColour(style::text);
         graphics.setFont(juce::FontOptions(11.0f, juce::Font::bold));
-        graphics.drawText("IMAGE PLANE", 12, 7, 150, 18, juce::Justification::centredLeft);
+        graphics.drawText("PROCESSED IMAGE", 12, 7, 150, 18, juce::Justification::centredLeft);
         graphics.setColour(style::textDim);
         graphics.setFont(juce::FontOptions(10.5f));
         graphics.drawText("drag centre / white rotate / pink scale / top roll", 118, 7,
@@ -169,8 +171,8 @@ public:
             setParameter(processor_, "position_y", clamp(start_.positionY - delta.y / unit, -1.0f, 1.0f));
             break;
         case Drag::Scale:
-            setParameter(processor_, "scale_x", clamp(start_.scaleX + delta.x / unit, 0.05f, 2.0f));
-            setParameter(processor_, "scale_y", clamp(start_.scaleY - delta.y / unit, 0.05f, 2.0f));
+            setParameter(processor_, "scale_x", clamp(start_.scaleX + delta.x / unit, 0.05f, 4.0f));
+            setParameter(processor_, "scale_y", clamp(start_.scaleY - delta.y / unit, 0.05f, 4.0f));
             break;
         case Drag::Rotate:
             setParameter(processor_, "yaw", clamp(start_.yawDegrees + 0.75f * delta.x, -180.0f, 180.0f));
@@ -207,7 +209,7 @@ private:
     float viewUnit() const
     {
         const auto area = drawingArea();
-        return std::max(1.0f, std::min(area.getWidth(), area.getHeight()) / 5.0f);
+        return std::max(1.0f, std::min(area.getWidth(), area.getHeight()) / 3.0f);
     }
 
     std::array<juce::Point<float>, 4> screenPoints(const ProjectedPlane& projected) const
@@ -215,13 +217,21 @@ private:
         std::array<juce::Point<float>, 4> points;
         const auto centre = drawingArea().getCentre();
         const auto unit = viewUnit();
+        const auto& a = projected.corners[0];
+        const auto& b = projected.corners[1];
+        const auto& d = projected.corners[3];
+        constexpr std::array<std::array<float, 2>, 4> corners {{{-1, -1}, {1, -1}, {1, 1}, {-1, 1}}};
         for (std::size_t i = 0; i < points.size(); ++i)
-            points[i] = {centre.x + projected.corners[i].stereo * unit,
-                         centre.y - projected.corners[i].frequency * unit};
+        {
+            const auto u = 0.5f * (corners[i][0] * aspectX_ + 1.0f);
+            const auto v = 0.5f * (corners[i][1] * aspectY_ + 1.0f);
+            points[i] = {centre.x + (a.stereo + u * (b.stereo - a.stereo) + v * (d.stereo - a.stereo)) * unit,
+                         centre.y - (a.frequency + u * (b.frequency - a.frequency) + v * (d.frequency - a.frequency)) * unit};
+        }
         return points;
     }
 
-    static Handles handlePoints(const std::array<juce::Point<float>, 4>& points)
+    Handles handlePoints(const std::array<juce::Point<float>, 4>& points) const
     {
         const auto centre = 0.25f * (points[0] + points[1] + points[2] + points[3]);
         const auto right = 0.5f * (points[1] + points[2]);
@@ -229,7 +239,12 @@ private:
         auto direction = top - centre;
         const auto length = std::max(1.0f, direction.getDistanceFromOrigin());
         direction *= 22.0f / length;
-        return {centre, points[2], right, top, top + direction};
+        const auto bounds = drawingArea().reduced(8.0f);
+        const auto constrain = [bounds](juce::Point<float> point) {
+            return juce::Point<float> {clamp(point.x, bounds.getX(), bounds.getRight()),
+                                       clamp(point.y, bounds.getY(), bounds.getBottom())};
+        };
+        return {constrain(centre), constrain(points[2]), constrain(right), constrain(top), constrain(top + direction)};
     }
 
     static void drawHandle(juce::Graphics& graphics, juce::Point<float> point, juce::Colour colour, float radius)
@@ -288,6 +303,7 @@ private:
 
     HolotonerProcessor& processor_;
     juce::Image image_;
+    float aspectX_ = 1.0f, aspectY_ = 1.0f;
     PlaneTransform start_;
     Drag drag_ = Drag::None;
 };
@@ -312,57 +328,71 @@ public:
         const auto well = getLocalBounds().toFloat();
         style::paintWell(graphics, well);
         const auto area = well.reduced(16.0f).withTrimmedTop(22.0f).withTrimmedBottom(24.0f);
-        const juce::Point<float> centre {area.getCentreX(), area.getBottom() - 2.0f};
-        const auto radius = std::max(10.0f, std::min(0.5f * area.getWidth() - 10.0f, area.getHeight() - 8.0f));
-
+        const juce::Point<float> origin {area.getCentreX(), area.getBottom() - 2.0f};
+        const auto radius = std::max(10.0f, std::min(0.5f * area.getWidth() - 4.0f, area.getHeight() - 8.0f));
         graphics.saveState();
         graphics.reduceClipRegion(area.toNearestInt());
         graphics.setColour(style::grid);
         for (float fraction : {0.25f, 0.5f, 0.75f, 1.0f}) {
             const auto r = radius * fraction;
-            graphics.drawEllipse(juce::Rectangle<float>(2.0f * r, 2.0f * r).withCentre(centre), 1.0f);
+            graphics.drawEllipse(juce::Rectangle<float>(2.0f * r, 2.0f * r).withCentre(origin), 1.0f);
         }
-        for (float degrees : {-60.0f, -30.0f, 0.0f, 30.0f, 60.0f}) {
-            const auto angle = (-90.0f + degrees) * pi / 180.0f;
-            graphics.drawLine(centre.x, centre.y, centre.x + radius * std::cos(angle),
-                              centre.y + radius * std::sin(angle), 1.0f);
+        for (float degrees : {-45.0f, 0.0f, 45.0f}) {
+            const auto angle = degrees * pi / 180.0f;
+            graphics.drawLine(origin.x, origin.y, origin.x + radius * std::sin(angle),
+                              origin.y - radius * std::cos(angle), 1.0f);
         }
-
-        const auto projected = holotoner::projectPlane(processor_.planeTransform());
-        if (hasMask_)
-            drawMask(graphics, centre, radius, projected);
-        juce::Path plane;
-        for (std::size_t i = 0; i < projected.corners.size(); ++i) {
-            const auto point = polarPoint(centre, radius, projected.corners[i]);
-            if (i == 0)
-                plane.startNewSubPath(point);
-            else
-                plane.lineTo(point);
+        const auto toScreen = [origin, radius](holotoner::ScopePoint point) {
+            return juce::Point<float> {origin.x + radius * point.x, origin.y - radius * point.y};
+        };
+        const auto isPhase = processor_.state().getRawParameterValue("image_target")->load() >= 2.5f;
+        const auto projection = processor_.state().getRawParameterValue("image_projection")->load() >= 0.5f
+            ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
+        if (hasMask_ && isPhase) {
+            auto transform = processor_.planeTransform();
+            transform.scaleX *= mask_.aspectX;
+            transform.scaleY *= mask_.aspectY;
+            const auto plane = holotoner::projectPlane(transform);
+            for (int y = 0; y < holotoner::kImageMaskHeight; ++y)
+                for (int x = 0; x < holotoner::kImageMaskWidth; ++x) {
+                    const auto value = mask_.at(x, y);
+                    if (value <= 0.001f)
+                        continue;
+                    const auto point = holotoner::phaseMapPoint(plane,
+                        2.0f * static_cast<float>(x) / static_cast<float>(holotoner::kImageMaskWidth - 1) - 1.0f,
+                        1.0f - 2.0f * static_cast<float>(y) / static_cast<float>(holotoner::kImageMaskHeight - 1),
+                        projection);
+                    if (point.y < 0.0f || std::hypot(point.x, point.y) > 1.0f)
+                        continue;
+                    const auto screen = toScreen(point);
+                    graphics.setColour(style::textDim.withAlpha(0.22f * value));
+                    graphics.fillRect(juce::Rectangle<float>(2.0f, 2.0f).withCentre(screen));
+                }
         }
-        plane.closeSubPath();
-        graphics.setColour(style::signal.withAlpha(0.08f));
-        graphics.fillPath(plane);
-        graphics.setColour(style::signal.withAlpha(0.45f));
-        graphics.strokePath(plane, juce::PathStrokeType(1.2f));
-
-        const auto meters = processor_.meterState();
-        const auto latestAnalysis = processor_.polarAnalysis();
-        if (latestAnalysis.revision != 0)
-            analysis_ = latestAnalysis;
-        drawSpectralOutput(graphics, centre, radius, analysis_);
-        drawMeter(graphics, centre, radius, meters.inputLeft, meters.inputRight,
-                  style::textDim.withAlpha(0.65f), 3.0f);
+        const auto count = processor_.scopeSamples(samples_.data(), static_cast<int>(samples_.size()));
+        // A fixed, labelled +14 dB display gain, applied identically to both
+        // measured input and output. This is NOT a fabricated image trace.
+        for (int layer = 0; layer < 2; ++layer) {
+            graphics.setColour(layer == 0 ? style::textDim.withAlpha(0.18f) : style::signal.withAlpha(0.38f));
+            for (int i = 0; i < count; ++i) {
+                const auto& sample = samples_[static_cast<std::size_t>(i)];
+                const auto left = layer == 0 ? sample.inputLeft : sample.outputLeft;
+                const auto right = layer == 0 ? sample.inputRight : sample.outputRight;
+                if (std::abs(left) + std::abs(right) < 1.0e-6f)
+                    continue;
+                const auto point = toScreen(holotoner::stereoToScopePoint(left * 5.0f, right * 5.0f));
+                graphics.fillRect(juce::Rectangle<float>(1.35f, 1.35f).withCentre(point));
+            }
+        }
         graphics.restoreState();
-
         graphics.setColour(style::text);
         graphics.setFont(juce::FontOptions(11.0f, juce::Font::bold));
-        graphics.drawText("POLAR / OUTPUT", 12, 7, 150, 18, juce::Justification::centredLeft);
+        graphics.drawText("POLAR SAMPLE / +14 dB", 12, 7, 190, 18, juce::Justification::centredLeft);
         graphics.setColour(style::textDim);
         graphics.setFont(juce::FontOptions(10.5f));
-        graphics.drawText("input", getWidth() - 120, 7, 42, 18, juce::Justification::centredRight);
+        graphics.drawText("target / input", getWidth() - 180, 7, 100, 18, juce::Justification::centredRight);
         graphics.setColour(style::signal);
         graphics.drawText("output", getWidth() - 74, 7, 62, 18, juce::Justification::centredRight);
-
         const auto correlation = clamp(processor_.meterState().outputCorrelation, -1.0f, 1.0f);
         const auto bar = juce::Rectangle<float>(area.getX(), well.getBottom() - 21.0f, area.getWidth(), 5.0f);
         graphics.setColour(style::grid);
@@ -371,86 +401,13 @@ public:
         const auto centreX = bar.getCentreX();
         const auto valueX = centreX + 0.5f * bar.getWidth() * correlation;
         graphics.fillRoundedRectangle(juce::Rectangle<float>::leftTopRightBottom(
-                                          std::min(centreX, valueX), bar.getY(), std::max(centreX, valueX), bar.getBottom()),
-                                      2.5f);
+            std::min(centreX, valueX), bar.getY(), std::max(centreX, valueX), bar.getBottom()), 2.5f);
     }
 
 private:
-    static void drawSpectralOutput(juce::Graphics& graphics, juce::Point<float> centre,
-                                   float maximumRadius, const holotoner::ImageSpatializer::Analysis& analysis)
-    {
-        constexpr auto bins = holotoner::ImageSpatializer::kAnalysisBins;
-        for (std::size_t i = 0; i < bins; ++i) {
-            const auto decibels = 20.0f * std::log10(std::max(analysis.level[i], 1.0e-6f));
-            const auto visibility = clamp((decibels + 60.0f) / 60.0f, 0.0f, 1.0f);
-            if (visibility <= 0.01f)
-                continue;
-            const auto frequency = (static_cast<float>(i) + 0.5f) / static_cast<float>(bins);
-            const auto radius = maximumRadius * (0.25f + 0.70f * frequency);
-            const auto balance = clamp(analysis.balance[i], -1.0f, 1.0f);
-            const auto correlation = clamp(analysis.correlation[i], -1.0f, 1.0f);
-            const auto centreDegrees = -90.0f + 60.0f * balance;
-            const auto halfSpreadDegrees = 28.0f * std::sqrt(0.5f * (1.0f - correlation));
-            const auto pointAt = [centre, radius](float degrees) {
-                const auto angle = degrees * pi / 180.0f;
-                return juce::Point<float> {centre.x + radius * std::cos(angle),
-                                           centre.y + radius * std::sin(angle)};
-            };
-            const auto left = pointAt(centreDegrees - halfSpreadDegrees);
-            const auto right = pointAt(centreDegrees + halfSpreadDegrees);
-            const auto point = pointAt(centreDegrees);
-            graphics.setColour(style::signal.withAlpha(0.10f + 0.58f * visibility));
-            graphics.drawLine(juce::Line<float>(left, right), 0.75f + 2.0f * visibility);
-            const auto diameter = 2.0f + 4.0f * visibility;
-            graphics.fillEllipse(juce::Rectangle<float>(diameter, diameter).withCentre(point));
-        }
-    }
-
-    void drawMask(juce::Graphics& graphics, juce::Point<float> centre, float radius,
-                  const ProjectedPlane& projected) const
-    {
-        constexpr int stride = 4;
-        for (int y = 0; y < holotoner::kImageMaskHeight; y += stride)
-            for (int x = 0; x < holotoner::kImageMaskWidth; x += stride) {
-                const auto value = mask_.at(x, y);
-                if (value <= 0.01f)
-                    continue;
-                const auto u = static_cast<float>(x) / static_cast<float>(holotoner::kImageMaskWidth - 1);
-                const auto topToBottom = static_cast<float>(y) / static_cast<float>(holotoner::kImageMaskHeight - 1);
-                const auto vertical = 1.0f - topToBottom;
-                const auto interpolate = [](const holotoner::ProjectedPoint& a,
-                                            const holotoner::ProjectedPoint& b, float amount) {
-                    return holotoner::ProjectedPoint {a.stereo + amount * (b.stereo - a.stereo),
-                                                       a.frequency + amount * (b.frequency - a.frequency),
-                                                       a.depth + amount * (b.depth - a.depth)};
-                };
-                const auto bottom = interpolate(projected.corners[0], projected.corners[1], u);
-                const auto top = interpolate(projected.corners[3], projected.corners[2], u);
-                const auto sample = interpolate(bottom, top, vertical);
-                const auto point = polarPoint(centre, radius, sample);
-                graphics.setColour(style::text.withAlpha(0.04f + 0.13f * value));
-                graphics.fillEllipse(juce::Rectangle<float>(5.0f, 5.0f).withCentre(point));
-            }
-    }
-
-    static void drawMeter(juce::Graphics& graphics, juce::Point<float> centre, float maximumRadius,
-                          float left, float right, juce::Colour colour, float width)
-    {
-        const auto total = left + right;
-        const auto balance = total > 1.0e-9f ? clamp((right - left) / total, -1.0f, 1.0f) : 0.0f;
-        const auto level = clamp(std::sqrt(std::max(left, right)), 0.0f, 1.0f);
-        const auto angle = (-90.0f + 60.0f * balance) * pi / 180.0f;
-        const auto end = juce::Point<float> {centre.x + maximumRadius * level * std::cos(angle),
-                                             centre.y + maximumRadius * level * std::sin(angle)};
-        graphics.setColour(colour.withAlpha(0.12f));
-        graphics.drawLine(centre.x, centre.y, end.x, end.y, width + 8.0f);
-        graphics.setColour(colour);
-        graphics.drawLine(centre.x, centre.y, end.x, end.y, width);
-    }
-
     HolotonerProcessor& processor_;
     holotoner::ImageMask mask_;
-    holotoner::ImageSpatializer::Analysis analysis_;
+    std::array<HolotonerProcessor::ScopeSample, 16384> samples_ {};
     bool hasMask_ = false;
 };
 
@@ -519,7 +476,7 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
     configureLabel(gainLabel_, "GAIN");
     configureLabel(fillLabel_, "FILL");
     configureLabel(amountLabel_, "AMOUNT");
-    target_.addItemList({"Off", "Place", "Level"}, 1);
+    target_.addItemList({"Off", "Spectral place", "Spectral level", "Phase map"}, 1);
     channel_.addItemList({"Off", "Luma", "Alpha", "Red", "Green", "Blue"}, 1);
     addAndMakeVisible(target_);
     addAndMakeVisible(channel_);
@@ -544,6 +501,19 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
         processor_.state(), "image_normalize", normalize_);
     invertAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
         processor_.state(), "image_invert", invert_);
+    configureLabel(projectionLabel_, "PROJECTION");
+    configureLabel(thresholdLabel_, "THRESHOLD");
+    projection_.addItemList({"XY rectangle", "Polar warp"}, 1);
+    addAndMakeVisible(projection_);
+    configureSlider(threshold_, true);
+    binary_.setColour(juce::ToggleButton::textColourId, style::text);
+    addAndMakeVisible(binary_);
+    projectionAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor_.state(), "image_projection", projection_);
+    thresholdAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor_.state(), "image_threshold", threshold_);
+    binaryAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor_.state(), "image_binary", binary_);
 
     status_.setFont(juce::FontOptions(10.5f));
     status_.setColour(juce::Label::textColourId, style::textDim);
@@ -552,7 +522,7 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
     addAndMakeVisible(*polarView_);
 
     setResizable(true, true);
-    setResizeLimits(760, 480, 1440, 920);
+    setResizeLimits(900, 560, 1600, 1000);
     setSize(1040, 650);
     startTimerHz(30);
     refresh();
@@ -595,6 +565,14 @@ void HolotonerEditor::resized()
     area.removeFromTop(8);
     status_.setBounds(area.removeFromBottom(24));
     area.removeFromBottom(4);
+    auto secondRow = area.removeFromBottom(44);
+    projectionLabel_.setBounds(secondRow.getX(), secondRow.getY(), 125, 15);
+    projection_.setBounds(secondRow.getX(), secondRow.getY() + 15, 125, 26);
+    secondRow.removeFromLeft(137);
+    thresholdLabel_.setBounds(secondRow.getX(), secondRow.getY(), 180, 15);
+    threshold_.setBounds(secondRow.getX(), secondRow.getY() + 15, 180, 26);
+    secondRow.removeFromLeft(192);
+    binary_.setBounds(secondRow.removeFromLeft(64).withTrimmedTop(14));
     auto controls = area.removeFromBottom(48);
     const auto placeControl = [&controls](juce::Label& label, juce::Component& control, int width) {
         auto slot = controls.removeFromLeft(width);
@@ -602,7 +580,7 @@ void HolotonerEditor::resized()
         control.setBounds(slot.removeFromTop(28));
         controls.removeFromLeft(6);
     };
-    placeControl(targetLabel_, target_, 74);
+    placeControl(targetLabel_, target_, 122);
     placeControl(channelLabel_, channel_, 84);
     placeControl(gainLabel_, gain_, 116);
     placeControl(fillLabel_, fill_, 116);
@@ -719,11 +697,11 @@ void HolotonerEditor::refresh()
     const bool imageChanged = image != currentImage_;
     if (image != currentImage_) {
         currentImage_ = image;
-        planeView_->setImage(image != nullptr ? image->image : juce::Image {});
     }
     const auto mask = processor_.imageMask();
     if (mask != currentMask_ || imageChanged) {
         currentMask_ = mask;
+        planeView_->setMask(image != nullptr && mask != nullptr ? mask.get() : nullptr);
         polarView_->setMask(image != nullptr && mask != nullptr ? mask.get() : nullptr);
     }
 
@@ -745,5 +723,9 @@ void HolotonerEditor::refresh()
                                              : "Host input";
     if (image != nullptr)
         message += "    Image: " + image->name;
-    status_.setText(message + "    Plane gestures are automatable; polar is read-only.", juce::dontSendNotification);
+    if (target_.getSelectedId() == 4)
+        message += "    Phase map reshapes the waveform; source level changes its reach.";
+    else
+        message += "    Polar measures audio; image gestures are automatable.";
+    status_.setText(message, juce::dontSendNotification);
 }

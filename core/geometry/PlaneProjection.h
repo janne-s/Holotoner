@@ -6,7 +6,7 @@ namespace holotoner {
 
 struct PlaneTransform {
     float positionX = 0.0f; ///< normalized stereo centre, -1 left ... 1 right
-    float positionY = 0.0f; ///< normalized logarithmic-frequency centre
+    float positionY = 0.0f; ///< normalized vertical plane centre
     float scaleX = 1.0f;
     float scaleY = 1.0f;
     float pitchDegrees = 0.0f; ///< rotation around local X
@@ -16,7 +16,7 @@ struct PlaneTransform {
 
 struct ProjectedPoint {
     float stereo = 0.0f;
-    float frequency = 0.0f;
+    float frequency = 0.0f; ///< vertical coordinate; log-frequency only in spectral modes
     float depth = 0.0f;
 };
 

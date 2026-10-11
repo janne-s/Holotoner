@@ -12,11 +12,8 @@
 #include <mutex>
 
 /**
- * Development wrapper around the first tested core invariant.
- *
- * This is deliberately not a released Holotoner UI. The production editor,
- * image state and analyser are still built as coherent development stages so
- * an incomplete shell is never presented as a product version.
+ * Native wrapper: immutable media exchange, portable image DSP, real L/R
+ * scope history, embedded image state, and shared Standalone/plug-in editor.
  */
 class HolotonerProcessor final : public juce::AudioProcessor, private juce::Timer {
 public:
@@ -64,7 +61,9 @@ public:
     juce::AudioProcessorValueTreeState& state() { return parameters_; }
     holotoner::PlaneTransform planeTransform() const;
     MeterState meterState() const;
-    holotoner::ImageSpatializer::Analysis polarAnalysis() const;
+    struct ScopeSample { float inputLeft, inputRight, outputLeft, outputRight; };
+    // UI-only read of a bounded, non-tearing atomic sample history.
+    int scopeSamples(ScopeSample* destination, int capacity) const;
 
     void setSourceKind(holotoner::SourceKind kind) { sourceKind_.store(static_cast<int>(kind)); }
     holotoner::SourceKind sourceKind() const
@@ -114,6 +113,9 @@ private:
     std::atomic<float>* imageNormalize_ = nullptr;
     std::atomic<float>* imageInvert_ = nullptr;
     std::atomic<float>* imageAmount_ = nullptr;
+    std::atomic<float>* imageProjection_ = nullptr;
+    std::atomic<float>* imageThreshold_ = nullptr;
+    std::atomic<float>* imageBinary_ = nullptr;
     holotoner::ImageSpatializer engine_;
     std::atomic<float> inputLeft_ {0.0f};
     std::atomic<float> inputRight_ {0.0f};
@@ -125,11 +127,10 @@ private:
     float meterOutputLeft_ = 0.0f;      ///< audio thread
     float meterOutputRight_ = 0.0f;     ///< audio thread
     float meterDecayPerSample_ = 0.0f;  ///< audio thread
-    std::array<std::atomic<float>, holotoner::ImageSpatializer::kAnalysisBins> analysisLevel_ {};
-    std::array<std::atomic<float>, holotoner::ImageSpatializer::kAnalysisBins> analysisBalance_ {};
-    std::array<std::atomic<float>, holotoner::ImageSpatializer::kAnalysisBins> analysisCorrelation_ {};
-    std::atomic<std::uint64_t> analysisSequence_ {0};
-    std::uint64_t publishedAnalysisRevision_ = 0; ///< audio thread
+    static constexpr std::size_t kScopeHistory = 32768;
+    std::array<std::atomic<std::uint64_t>, kScopeHistory> scopeInput_ {}, scopeOutput_ {};
+    std::atomic<std::uint64_t> scopePublished_ {0};
+    std::uint64_t scopeWritten_ = 0; ///< audio thread only
 
     holotoner::SourcePlayer sourcePlayer_;
     holotoner::SharedExchange<holotoner::SourceAudio> sources_;

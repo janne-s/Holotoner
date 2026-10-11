@@ -40,6 +40,8 @@ void ImageSpatializer::prepare(double sampleRate)
         value *= scale;
     frameSmoothing_ = 1.0 - std::exp(-static_cast<double>(kHopSize) / (0.02 * sampleRate_));
     wetRate_ = static_cast<float>(1.0 - std::exp(-1.0 / (0.02 * sampleRate_)));
+    sourceRelease_ = static_cast<float>(std::exp(-1.0 / (0.06 * sampleRate_)));
+    dcPole_ = static_cast<float>(std::exp(-2.0 * std::numbers::pi * 5.0 / sampleRate_));
     reset();
 }
 
@@ -64,6 +66,14 @@ void ImageSpatializer::reset()
     inputAt_ = dryAt_ = outputAt_ = filled_ = sinceHop_ = 0;
     wetCurrent_ = parameters_.wet;
     safetyResets_ = 0;
+    scanPhase_ = 0.0;
+    scanPresence_ = sourceEnvelope_ = dcLeft_ = dcRight_ = 0.0f;
+    previousPhaseLeft_ = previousPhaseRight_ = 0.0f;
+    polarMix_ = parameters_.phaseProjection == PhaseProjection::Polar ? 1.0f : 0.0f;
+    phasePlane_ = projectPlane(parameters_.plane);
+    phasePlaneCurrent_ = phasePlane_;
+    previousScan_.fill({});
+    scanFrameBlend_ = 1.0f;
 }
 
 void ImageSpatializer::setParameters(Parameters parameters)
@@ -71,16 +81,18 @@ void ImageSpatializer::setParameters(Parameters parameters)
     auto& plane = parameters.plane;
     plane.positionX = std::clamp(finiteOr(plane.positionX, 0.0f), -1.0f, 1.0f);
     plane.positionY = std::clamp(finiteOr(plane.positionY, 0.0f), -1.0f, 1.0f);
-    plane.scaleX = std::clamp(finiteOr(plane.scaleX, 1.0f), 0.05f, 2.0f);
-    plane.scaleY = std::clamp(finiteOr(plane.scaleY, 1.0f), 0.05f, 2.0f);
+    plane.scaleX = std::clamp(finiteOr(plane.scaleX, 1.0f), 0.05f, 4.0f);
+    plane.scaleY = std::clamp(finiteOr(plane.scaleY, 1.0f), 0.05f, 4.0f);
     plane.pitchDegrees = std::clamp(finiteOr(plane.pitchDegrees, 0.0f), -180.0f, 180.0f);
     plane.yawDegrees = std::clamp(finiteOr(plane.yawDegrees, 0.0f), -180.0f, 180.0f);
     plane.rollDegrees = std::clamp(finiteOr(plane.rollDegrees, 0.0f), -180.0f, 180.0f);
-    parameters.imageAmount = std::clamp(finiteOr(parameters.imageAmount, 0.7f), 0.0f, 1.0f);
+    parameters.imageAmount = std::clamp(finiteOr(parameters.imageAmount, 1.0f), 0.0f, 1.0f);
     parameters.wet = std::clamp(finiteOr(parameters.wet, 1.0f), 0.0f, 1.0f);
     parameters.target = static_cast<ImageTarget>(
         std::clamp(static_cast<int>(parameters.target), static_cast<int>(ImageTarget::Off),
-                   static_cast<int>(ImageTarget::Level)));
+                   static_cast<int>(ImageTarget::Phase)));
+    parameters.phaseProjection = parameters.phaseProjection == PhaseProjection::Polar
+        ? PhaseProjection::Polar : PhaseProjection::Cartesian;
     parameters_ = parameters;
 }
 
@@ -112,10 +124,50 @@ void ImageSpatializer::process(float* left, float* right, int sampleCount, const
             renderFrame(mask);
         }
         const auto read = (outputAt_ + outputSize - (kFftSize - 1)) % outputSize;
-        const auto wetLeft = outputLeft_[read];
-        const auto wetRight = outputRight_[read];
+        auto wetLeft = outputLeft_[read];
+        auto wetRight = outputRight_[read];
         outputLeft_[read] = 0.0;
         outputRight_[read] = 0.0;
+        const auto sourceMagnitude = std::max(std::abs(delayedLeft), std::abs(delayedRight));
+        sourceEnvelope_ = std::max(sourceMagnitude, sourceEnvelope_ * sourceRelease_);
+        // The source drives scan travel and polarity; silence cannot generate sound.
+        scanPhase_ += 40.0 * static_cast<double>(sourceMagnitude) / sampleRate_;
+        scanPhase_ -= std::floor(scanPhase_);
+        const auto scanPosition = (scanPhase_ < 0.5 ? 2.0 * scanPhase_ : 2.0 * (1.0 - scanPhase_))
+            * static_cast<double>(ImageMask::kScanSize - 1);
+        const auto at = static_cast<std::size_t>(scanPosition);
+        const auto next = std::min(at + 1, ImageMask::kScanSize - 1);
+        const auto fraction = static_cast<float>(scanPosition - static_cast<double>(at));
+        const auto& a = smoothedMask_.scan[at];
+        const auto& b = smoothedMask_.scan[next];
+        const auto& oldA = previousScan_[at];
+        const auto& oldB = previousScan_[next];
+        const auto oldX = oldA.x + fraction * (oldB.x - oldA.x);
+        const auto oldY = oldA.y + fraction * (oldB.y - oldA.y);
+        scanFrameBlend_ = std::min(1.0f, scanFrameBlend_ + 1.0f / static_cast<float>(kHopSize));
+        const auto x = oldX + scanFrameBlend_ * (a.x + fraction * (b.x - a.x) - oldX);
+        const auto y = oldY + scanFrameBlend_ * (a.y + fraction * (b.y - a.y) - oldY);
+        for (std::size_t corner = 0; corner < phasePlane_.corners.size(); ++corner) {
+            auto& current = phasePlaneCurrent_.corners[corner];
+            const auto& target = phasePlane_.corners[corner];
+            current.stereo += wetRate_ * (target.stereo - current.stereo);
+            current.frequency += wetRate_ * (target.frequency - current.frequency);
+        }
+        polarMix_ += wetRate_ * ((parameters_.phaseProjection == PhaseProjection::Polar ? 1.0f : 0.0f) - polarMix_);
+        const auto cartesian = scopePointToStereo(phaseMapPoint(phasePlaneCurrent_, x, y, PhaseProjection::Cartesian));
+        const auto polar = scopePointToStereo(phaseMapPoint(phasePlaneCurrent_, x, y, PhaseProjection::Polar));
+        const auto carrier = std::abs(delayedLeft) >= std::abs(delayedRight) ? delayedLeft : delayedRight;
+        const auto gain = sourceMagnitude > 1.0e-7f
+            ? std::min(sourceEnvelope_, 1.0f) * (carrier >= 0.0f ? 1.0f : -1.0f) * scanPresence_ : 0.0f;
+        const auto phaseLeft = gain * (cartesian.left + polarMix_ * (polar.left - cartesian.left));
+        const auto phaseRight = gain * (cartesian.right + polarMix_ * (polar.right - cartesian.right));
+        dcLeft_ = phaseLeft - previousPhaseLeft_ + dcPole_ * dcLeft_;
+        dcRight_ = phaseRight - previousPhaseRight_ + dcPole_ * dcRight_;
+        previousPhaseLeft_ = phaseLeft;
+        previousPhaseRight_ = phaseRight;
+        const auto phaseWeight = targetWeights_[3] * maskPresence_ * smoothedParameters_.imageAmount;
+        wetLeft += phaseWeight * (static_cast<double>(dcLeft_) - wetLeft);
+        wetRight += phaseWeight * (static_cast<double>(dcRight_) - wetRight);
         wetCurrent_ += (parameters_.wet - wetCurrent_) * wetRate_;
         const auto outLeft = static_cast<double>(delayedLeft) + static_cast<double>(wetCurrent_)
             * (wetLeft - static_cast<double>(delayedLeft));
@@ -136,6 +188,10 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
 {
     smoothFrameState(mask);
     const auto projection = projectPlane(smoothedParameters_.plane);
+    auto phaseTransform = smoothedParameters_.plane;
+    phaseTransform.scaleX *= targetMask_.aspectX;
+    phaseTransform.scaleY *= targetMask_.aspectY;
+    phasePlane_ = projectPlane(phaseTransform);
     buildRows(projection);
     for (std::size_t i = 0; i < kFftSize; ++i) {
         const auto at = (inputAt_ + i) % kFftSize;
@@ -246,6 +302,14 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     smooth(smoothedParameters_.imageAmount, parameters_.imageAmount);
     for (std::size_t i = 0; i < smoothedMask_.values.size(); ++i)
         smooth(smoothedMask_.values[i], targetMask_.values[i]);
+    previousScan_ = smoothedMask_.scan;
+    scanFrameBlend_ = 0.0f;
+    if (targetMask_.hasScan)
+        for (std::size_t i = 0; i < ImageMask::kScanSize; ++i) {
+            smooth(smoothedMask_.scan[i].x, targetMask_.scan[i].x);
+            smooth(smoothedMask_.scan[i].y, targetMask_.scan[i].y);
+        }
+    smooth(scanPresence_, targetMask_.hasScan ? 1.0f : 0.0f);
     smooth(maskPresence_, targetMaskPresence_);
     smoothedMask_.hasSource = maskPresence_ > 1.0e-6;
     const auto selectedTarget = static_cast<std::size_t>(parameters_.target);
@@ -308,7 +372,7 @@ ImageSpatializer::RowTarget ImageSpatializer::rowForFrequency(double normalizedF
 
 void ImageSpatializer::spatialize(std::complex<double> left, std::complex<double> right,
                                   double signedWidth, double basePosition, const RowTarget& row,
-                                  const std::array<double, 3>& targetWeights, double amount,
+                                  const std::array<double, 4>& targetWeights, double amount,
                                   std::complex<double>& outputLeft,
                                   std::complex<double>& outputRight)
 {

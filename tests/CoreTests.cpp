@@ -474,6 +474,145 @@ void blackImageCanSilenceLevelTarget()
     }
 }
 
+holotoner::ImageMask phaseFixture(bool mirror)
+{
+    holotoner::RgbaImage image;
+    image.width = image.height = 64;
+    image.pixels.resize(64 * 64 * 4);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) {
+            const auto px = mirror ? 63 - x : x;
+            const bool on = (px > 10 && px < 22 && y > 12 && y < 47)
+                || (px > 20 && px < 48 && y > 40 && y < 48);
+            const auto at = static_cast<std::size_t>((y * 64 + x) * 4);
+            for (std::size_t c = 0; c < 3; ++c)
+                image.pixels[at + c] = on ? 255 : 0;
+            image.pixels[at + 3] = 255;
+        }
+    holotoner::ImageMaskSettings settings;
+    settings.channel = holotoner::PixelChannel::Luma;
+    settings.binary = true;
+    settings.threshold = 0.5f;
+    return holotoner::buildImageMask(image, settings);
+}
+
+void phaseMapCoordinatesAreActualAudio()
+{
+    for (const auto point : {holotoner::ScopePoint {-0.4f, 0.6f}, {0.3f, 0.4f}, {0.0f, 0.8f}}) {
+        const auto audio = holotoner::scopePointToStereo(point);
+        for (const auto sign : {-1.0f, 1.0f}) {
+            const auto measured = holotoner::stereoToScopePoint(sign * audio.left, sign * audio.right);
+            expectNear(measured.x, point.x, 2.0e-6f, "actual Polar Sample x inverse");
+            expectNear(measured.y, point.y, 2.0e-6f, "actual Polar Sample y inverse");
+        }
+    }
+    holotoner::PlaneTransform transform;
+    transform.scaleX = transform.scaleY = 2.0f;
+    const auto plane = holotoner::projectPlane(transform);
+    const auto outer = holotoner::phaseMapPoint(plane, 1.0f, 1.0f, holotoner::PhaseProjection::Polar);
+    expectNear(outer.x, 1.0f, 1.0e-6f, "polar can span entire semicircle");
+    expectNear(outer.y, 0.0f, 1.0e-6f, "polar full-span edge");
+    const auto top = holotoner::phaseMapPoint(plane, 0.0f, 0.5f, holotoner::PhaseProjection::Cartesian);
+    expectNear(top.y, 1.0f, 0.0f, "cartesian can cover entire semicircle height");
+    const auto a = holotoner::phaseMapPoint(plane, -0.2f, 0.0f, holotoner::PhaseProjection::Cartesian);
+    const auto b = holotoner::phaseMapPoint(plane, 0.2f, 0.0f, holotoner::PhaseProjection::Cartesian);
+    expectNear(a.y, b.y, 0.0f, "cartesian edges stay straight");
+    const auto mask = phaseFixture(false);
+    for (const auto point : mask.scan) {
+        const auto x = static_cast<int>(std::lround((point.x + 1.0f) * 31.5f));
+        const auto y = static_cast<int>(std::lround((1.0f - point.y) * 31.5f));
+        expectNear(mask.at(x, y), 1.0f, 0.0f, "binary trajectory visits only selected pixels");
+    }
+}
+
+void phaseImageProcessing(double sampleRate)
+{
+    const auto mask = phaseFixture(false);
+    const auto other = phaseFixture(true);
+    if (!mask.hasScan || !other.hasScan) {
+        std::cerr << "phase map trajectory missing\n";
+        ++failures;
+    }
+    constexpr std::size_t count = 65536;
+    std::vector<float> input(count);
+    for (std::size_t i = 0; i < count; ++i)
+        input[i] = static_cast<float>(0.2 * std::sin(2.0 * 3.141592653589793 * 440.0
+                                                   * static_cast<double>(i) / sampleRate));
+    auto wholeL = input, wholeR = input, splitL = input, splitR = input;
+    auto otherL = input, otherR = input;
+    holotoner::ImageSpatializer whole, split, mirrored;
+    holotoner::ImageSpatializer::Parameters parameters;
+    parameters.target = holotoner::ImageTarget::Phase;
+    parameters.imageAmount = 1.0f;
+    parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
+    for (auto* engine : {&whole, &split, &mirrored}) {
+        engine->setParameters(parameters);
+        engine->prepare(sampleRate);
+    }
+    whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &mask);
+    mirrored.process(otherL.data(), otherR.data(), static_cast<int>(count), &other);
+    constexpr std::array<std::size_t, 3> blocks {1, 31, 512};
+    std::size_t at = 0, block = 0;
+    while (at < count) {
+        const auto length = std::min(count - at, blocks[block++ % blocks.size()]);
+        split.process(splitL.data() + at, splitR.data() + at, static_cast<int>(length), &mask);
+        at += length;
+    }
+    double difference = 0.0, stereo = 0.0;
+    int matches = 0, measured = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        expectNear(splitL[i], wholeL[i], 0.0f, "phase block independence left");
+        expectNear(splitR[i], wholeR[i], 0.0f, "phase block independence right");
+        if (!std::isfinite(wholeL[i]) || !std::isfinite(wholeR[i])
+            || std::abs(wholeL[i]) > 1.0f || std::abs(wholeR[i]) > 1.0f) {
+            std::cerr << "phase output not finite/bounded\n";
+            ++failures;
+            break;
+        }
+        if (i < 16384)
+            continue;
+        difference += std::pow(wholeL[i] - otherL[i], 2);
+        stereo += std::pow(wholeL[i] - wholeR[i], 2);
+        const auto point = holotoner::stereoToScopePoint(wholeL[i] * 5.0f, wholeR[i] * 5.0f);
+        const auto x = static_cast<int>(std::lround((point.x / 0.4f + 1.0f) * 31.5f));
+        const auto y = static_cast<int>(std::lround((1.0f - (point.y - 0.5f) / 0.4f) * 31.5f));
+        ++measured;
+        bool near = false;
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx)
+                near = near || mask.at(x + dx, y + dy) > 0.5f;
+        matches += near ? 1 : 0;
+    }
+    if (difference < 0.01 || stereo < 0.01) {
+        std::cerr << "phase image changes did not affect audio/stereo\n";
+        ++failures;
+    }
+    if (matches < measured * 7 / 10) {
+        std::cerr << "actual audio did not reproduce image field: " << matches << '/' << measured << '\n';
+        ++failures;
+    }
+    parameters.plane.yawDegrees = 180.0f;
+    mirrored.setParameters(parameters);
+    mirrored.prepare(sampleRate);
+    otherL = otherR = input;
+    mirrored.process(otherL.data(), otherR.data(), static_cast<int>(count), &mask);
+    for (std::size_t i = count - 512; i < count; ++i) {
+        expectNear(otherL[i], wholeR[i], 2.0e-5f, "phase backside swaps left");
+        expectNear(otherR[i], wholeL[i], 2.0e-5f, "phase backside swaps right");
+    }
+    parameters.plane.yawDegrees = 90.0f;
+    whole.setParameters(parameters);
+    wholeL = wholeR = input;
+    whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &mask);
+    for (std::size_t i = count - 512; i < count; ++i)
+        expectNear(wholeL[i], wholeR[i], 2.0e-5f, "phase edge-on is mono");
+    std::fill(wholeL.begin(), wholeL.end(), 0.0f);
+    std::fill(wholeR.begin(), wholeR.end(), 0.0f);
+    whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &mask);
+    for (std::size_t i = count - 512; i < count; ++i)
+        expectNear(wholeL[i], 0.0f, 1.0e-5f, "phase silence does not self-generate");
+}
+
 } // namespace
 
 int main()
@@ -494,6 +633,10 @@ int main()
     imageSpatializerEndpoints(96000.0);
     imageSpatializerMakesMonoImageStereo();
     blackImageCanSilenceLevelTarget();
+    phaseMapCoordinatesAreActualAudio();
+    phaseImageProcessing(44100.0);
+    phaseImageProcessing(48000.0);
+    phaseImageProcessing(96000.0);
     if (failures != 0)
         std::cerr << failures << " test assertion(s) failed\n";
     return failures == 0 ? 0 : 1;

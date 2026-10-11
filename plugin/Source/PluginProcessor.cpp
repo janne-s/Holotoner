@@ -4,12 +4,13 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <memory>
 
 namespace {
 
-constexpr int kStateVersion = 3;
+constexpr int kStateVersion = 4;
 constexpr int kOldestReadableStateVersion = 2;
 constexpr juce::int64 kMaximumImageFileBytes = 32 * 1024 * 1024;
 constexpr int kMaximumImageDimension = 1024;
@@ -88,6 +89,9 @@ HolotonerProcessor::HolotonerProcessor()
     imageNormalize_ = parameters_.getRawParameterValue("image_normalize");
     imageInvert_ = parameters_.getRawParameterValue("image_invert");
     imageAmount_ = parameters_.getRawParameterValue("image_amount");
+    imageProjection_ = parameters_.getRawParameterValue("image_projection");
+    imageThreshold_ = parameters_.getRawParameterValue("image_threshold");
+    imageBinary_ = parameters_.getRawParameterValue("image_binary");
     jassert(positionX_ != nullptr && positionY_ != nullptr && scaleX_ != nullptr && scaleY_ != nullptr
             && pitch_ != nullptr && yaw_ != nullptr && roll_ != nullptr && wet_ != nullptr
             && imageChannel_ != nullptr && imageTarget_ != nullptr && imageGain_ != nullptr
@@ -115,9 +119,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::paramete
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID {"position_y", 1}, "Position Y", normalized, 0.0f));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID {"scale_x", 1}, "Scale X", juce::NormalisableRange<float> {0.05f, 2.0f, 0.001f}, 1.0f));
+        juce::ParameterID {"scale_x", 1}, "Scale X", juce::NormalisableRange<float> {0.05f, 4.0f, 0.001f}, 1.0f));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID {"scale_y", 1}, "Scale Y", juce::NormalisableRange<float> {0.05f, 2.0f, 0.001f}, 1.0f));
+        juce::ParameterID {"scale_y", 1}, "Scale Y", juce::NormalisableRange<float> {0.05f, 4.0f, 0.001f}, 1.0f));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID {"pitch", 1}, "Pitch", degrees, 0.0f,
         juce::AudioParameterFloatAttributes().withLabel("deg")));
@@ -138,7 +142,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::paramete
         juce::StringArray {"Off", "Luma", "Alpha", "Red", "Green", "Blue"}, 1));
     layout.add(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID {"image_target", 1}, "Image Target",
-        juce::StringArray {"Off", "Place", "Level"}, 1));
+        juce::StringArray {"Off", "Spectral place", "Spectral level", "Phase map"}, 3));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        juce::ParameterID {"image_projection", 1}, "Image Projection",
+        juce::StringArray {"XY rectangle", "Polar warp"}, 0));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"image_threshold", 1}, "Image Threshold",
+        juce::NormalisableRange<float> {0.0f, 1.0f, 0.001f}, 0.0f));
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID {"image_binary", 1}, "Binary Image", false));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID {"image_gain", 1}, "Image Gain",
         juce::NormalisableRange<float> {0.0f, 8.0f, 0.01f, 0.5f}, 1.0f));
@@ -155,7 +167,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::paramete
         juce::ParameterID {"image_invert", 1}, "Invert Image", false));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID {"image_amount", 1}, "Image Amount",
-        juce::NormalisableRange<float> {0.0f, 1.0f, 0.001f}, 0.7f,
+        juce::NormalisableRange<float> {0.0f, 1.0f, 0.001f}, 1.0f,
         juce::AudioParameterFloatAttributes()
             .withLabel("%")
             .withStringFromValueFunction([](float value, int) { return juce::String(100.0f * value, 0); })
@@ -168,7 +180,9 @@ void HolotonerProcessor::prepareToPlay(double sampleRate, int)
     holotoner::ImageSpatializer::Parameters spatialParameters;
     spatialParameters.plane = planeTransform();
     spatialParameters.target = static_cast<holotoner::ImageTarget>(
-        juce::jlimit(0, 2, juce::roundToInt(imageTarget_->load(std::memory_order_relaxed))));
+        juce::jlimit(0, 3, juce::roundToInt(imageTarget_->load(std::memory_order_relaxed))));
+    spatialParameters.phaseProjection = imageProjection_->load(std::memory_order_relaxed) >= 0.5f
+        ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
     spatialParameters.imageAmount = imageAmount_->load(std::memory_order_relaxed);
     spatialParameters.wet = wet_->load(std::memory_order_relaxed);
     engine_.setParameters(spatialParameters);
@@ -182,13 +196,8 @@ void HolotonerProcessor::prepareToPlay(double sampleRate, int)
     outputLeft_.store(0.0f, std::memory_order_relaxed);
     outputRight_.store(0.0f, std::memory_order_relaxed);
     outputCorrelation_.store(0.0f, std::memory_order_relaxed);
-    for (std::size_t i = 0; i < holotoner::ImageSpatializer::kAnalysisBins; ++i) {
-        analysisLevel_[i].store(0.0f, std::memory_order_relaxed);
-        analysisBalance_[i].store(0.0f, std::memory_order_relaxed);
-        analysisCorrelation_[i].store(0.0f, std::memory_order_relaxed);
-    }
-    analysisSequence_.store(0, std::memory_order_release);
-    publishedAnalysisRevision_ = 0;
+    scopeWritten_ = 0;
+    scopePublished_.store(0, std::memory_order_release);
 }
 
 bool HolotonerProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -246,25 +255,26 @@ void HolotonerProcessor::processBlock(juce::AudioBuffer<float>& audio, juce::Mid
     holotoner::ImageSpatializer::Parameters spatialParameters;
     spatialParameters.plane = planeTransform();
     spatialParameters.target = static_cast<holotoner::ImageTarget>(
-        juce::jlimit(0, 2, juce::roundToInt(imageTarget_->load(std::memory_order_relaxed))));
+        juce::jlimit(0, 3, juce::roundToInt(imageTarget_->load(std::memory_order_relaxed))));
+    spatialParameters.phaseProjection = imageProjection_->load(std::memory_order_relaxed) >= 0.5f
+        ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
     spatialParameters.imageAmount = imageAmount_->load(std::memory_order_relaxed);
     spatialParameters.wet = wet_->load(std::memory_order_relaxed);
     engine_.setParameters(spatialParameters);
     const auto* mask = masks_.acquire();
     masks_.hold(0, mask);
-    engine_.process(audio.getWritePointer(0), audio.getWritePointer(1), samples, mask);
-    const auto& analysis = engine_.analysis();
-    if (analysis.revision != publishedAnalysisRevision_) {
-        const auto sequence = 2 * analysis.revision;
-        analysisSequence_.store(sequence - 1, std::memory_order_seq_cst);
-        for (std::size_t i = 0; i < holotoner::ImageSpatializer::kAnalysisBins; ++i) {
-            analysisLevel_[i].store(analysis.level[i], std::memory_order_relaxed);
-            analysisBalance_[i].store(analysis.balance[i], std::memory_order_relaxed);
-            analysisCorrelation_[i].store(analysis.correlation[i], std::memory_order_relaxed);
-        }
-        analysisSequence_.store(sequence, std::memory_order_release);
-        publishedAnalysisRevision_ = analysis.revision;
+    for (int i = 0; i < samples; ++i) {
+        const std::array<float, 2> pair {audio.getReadPointer(0)[i], audio.getReadPointer(1)[i]};
+        scopeInput_[(scopeWritten_ + static_cast<std::uint64_t>(i)) % kScopeHistory]
+            .store(std::bit_cast<std::uint64_t>(pair), std::memory_order_relaxed);
     }
+    engine_.process(audio.getWritePointer(0), audio.getWritePointer(1), samples, mask);
+    for (int i = 0; i < samples; ++i) {
+        const std::array<float, 2> pair {audio.getReadPointer(0)[i], audio.getReadPointer(1)[i]};
+        scopeOutput_[scopeWritten_++ % kScopeHistory]
+            .store(std::bit_cast<std::uint64_t>(pair), std::memory_order_relaxed);
+    }
+    scopePublished_.store(scopeWritten_, std::memory_order_release);
     const auto outputMeter = measureBlock(audio.getReadPointer(0), audio.getReadPointer(1), samples);
     meterOutputLeft_ = std::max(outputMeter.left, meterOutputLeft_ * meterDecay);
     meterOutputRight_ = std::max(outputMeter.right, meterOutputRight_ * meterDecay);
@@ -289,25 +299,20 @@ HolotonerProcessor::MeterState HolotonerProcessor::meterState() const
             outputCorrelation_.load(std::memory_order_relaxed)};
 }
 
-holotoner::ImageSpatializer::Analysis HolotonerProcessor::polarAnalysis() const
+int HolotonerProcessor::scopeSamples(ScopeSample* destination, int capacity) const
 {
-    holotoner::ImageSpatializer::Analysis result;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        const auto before = analysisSequence_.load(std::memory_order_acquire);
-        if ((before & 1U) != 0)
-            continue;
-        for (std::size_t i = 0; i < holotoner::ImageSpatializer::kAnalysisBins; ++i) {
-            result.level[i] = analysisLevel_[i].load(std::memory_order_relaxed);
-            result.balance[i] = analysisBalance_[i].load(std::memory_order_relaxed);
-            result.correlation[i] = analysisCorrelation_[i].load(std::memory_order_relaxed);
-        }
-        const auto after = analysisSequence_.load(std::memory_order_acquire);
-        if (before == after) {
-            result.revision = after / 2;
-            return result;
-        }
+    if (destination == nullptr || capacity <= 0)
+        return 0;
+    const auto end = scopePublished_.load(std::memory_order_acquire);
+    const auto available = std::min(end, static_cast<std::uint64_t>(kScopeHistory));
+    const auto count = std::min(available, static_cast<std::uint64_t>(capacity));
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const auto at = (end - available + i * available / count) % kScopeHistory;
+        const auto input = std::bit_cast<std::array<float, 2>>(scopeInput_[at].load(std::memory_order_relaxed));
+        const auto output = std::bit_cast<std::array<float, 2>>(scopeOutput_[at].load(std::memory_order_relaxed));
+        destination[i] = {input[0], input[1], output[0], output[1]};
     }
-    return result;
+    return static_cast<int>(count);
 }
 
 juce::AudioProcessorEditor* HolotonerProcessor::createEditor()
@@ -553,13 +558,17 @@ void HolotonerProcessor::rebuildImageMaskIfNeeded()
     settings.normalize = imageNormalize_->load(std::memory_order_relaxed) >= 0.5f;
     settings.invert = imageInvert_->load(std::memory_order_relaxed) >= 0.5f;
     settings.amount = 1.0f;
+    settings.threshold = imageThreshold_->load(std::memory_order_relaxed);
+    settings.binary = imageBinary_->load(std::memory_order_relaxed) >= 0.5f;
     const auto image = imageDocument();
     const bool settingsChanged = !hasBuiltMaskSettings_
         || settings.channel != builtMaskSettings_.channel
         || std::abs(settings.gain - builtMaskSettings_.gain) > 1.0e-6f
         || std::abs(settings.fill - builtMaskSettings_.fill) > 1.0e-6f
         || settings.normalize != builtMaskSettings_.normalize
-        || settings.invert != builtMaskSettings_.invert;
+        || settings.invert != builtMaskSettings_.invert
+        || settings.binary != builtMaskSettings_.binary
+        || std::abs(settings.threshold - builtMaskSettings_.threshold) > 1.0e-6f;
     if (image == maskImage_ && !settingsChanged)
         return;
     auto mask = std::make_shared<holotoner::ImageMask>();

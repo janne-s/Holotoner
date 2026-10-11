@@ -91,10 +91,14 @@ ImageMask buildImageMask(const RgbaImage& image, ImageMaskSettings settings)
     if (!image.isValid() || settings.channel == PixelChannel::Off)
         return result;
     result.hasSource = true;
+    const auto aspect = static_cast<float>(image.width) / static_cast<float>(image.height);
+    result.aspectX = std::min(aspect, 1.0f);
+    result.aspectY = std::min(1.0f / aspect, 1.0f);
 
     settings.gain = std::clamp(finiteOr(settings.gain, 1.0f), 0.0f, 8.0f);
     settings.fill = std::clamp(finiteOr(settings.fill, 0.0f), 0.0f, 1.0f);
     settings.amount = std::clamp(finiteOr(settings.amount, 1.0f), 0.0f, 1.0f);
+    settings.threshold = std::clamp(finiteOr(settings.threshold, 0.0f), 0.0f, 1.0f);
     std::array<float, result.values.size()> alpha {};
     float minimum = std::numeric_limits<float>::max();
     float maximum = std::numeric_limits<float>::lowest();
@@ -126,7 +130,34 @@ ImageMask buildImageMask(const RgbaImage& image, ImageMaskSettings settings)
     for (std::size_t i = 0; i < result.values.size(); ++i) {
         if (settings.invert)
             result.values[i] = std::max(0.0f, alpha[i] - result.values[i]);
+        const auto value = result.values[i];
+        result.values[i] = value > settings.threshold
+            ? (settings.binary ? alpha[i] : value) : 0.0f;
         result.values[i] = std::clamp(result.values[i] * settings.amount, 0.0f, 1.0f);
+    }
+    double total = 0.0;
+    for (const auto value : result.values)
+        total += value;
+    if (total > 1.0e-9) {
+        result.hasScan = true;
+        std::size_t cursor = 0;
+        double accumulated = 0.0;
+        for (int y = 0; y < kImageMaskHeight; ++y)
+            for (int column = 0; column < kImageMaskWidth; ++column) {
+                const auto x = (y % 2 == 0) ? column : kImageMaskWidth - 1 - column;
+                accumulated += result.at(x, y);
+                while (cursor < result.scan.size()
+                       && total * (static_cast<double>(cursor) + 0.5)
+                              / static_cast<double>(result.scan.size()) <= accumulated) {
+                    result.scan[cursor++] = {
+                        2.0f * static_cast<float>(x) / static_cast<float>(kImageMaskWidth - 1) - 1.0f,
+                        1.0f - 2.0f * static_cast<float>(y) / static_cast<float>(kImageMaskHeight - 1)};
+                }
+            }
+        while (cursor < result.scan.size()) {
+            result.scan[cursor] = result.scan[cursor - 1];
+            ++cursor;
+        }
     }
     return result;
 }

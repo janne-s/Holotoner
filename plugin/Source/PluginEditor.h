@@ -59,6 +59,13 @@ private:
     juce::Slider amount_;
     juce::ToggleButton normalize_ {"Normalize"};
     juce::ToggleButton invert_ {"Invert"};
+    juce::ComboBox projection_;
+    juce::Label projectionLabel_, thresholdLabel_;
+    juce::Slider threshold_;
+    juce::ToggleButton binary_ {"B/W"};
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> projectionAttachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> thresholdAttachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> binaryAttachment_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> targetAttachment_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> channelAttachment_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainAttachment_;

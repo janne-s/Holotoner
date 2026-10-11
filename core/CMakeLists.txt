@@ -2,6 +2,7 @@ add_library(holotoner_core STATIC
     audio/SourcePlayer.cpp
     dsp/Fft.cpp
     dsp/ImageSpatializer.cpp
+    dsp/PhaseMap.cpp
     dsp/StereoWidth.cpp
     geometry/PlaneProjection.cpp
     image/ImageMask.cpp)

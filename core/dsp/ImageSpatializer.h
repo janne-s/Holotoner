@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/dsp/Fft.h"
+#include "core/dsp/PhaseMap.h"
 #include "core/geometry/PlaneProjection.h"
 #include "core/image/ImageMask.h"
 
@@ -11,15 +12,15 @@
 
 namespace holotoner {
 
-/** Frequency-dependent destination for the selected image channel. */
-enum class ImageTarget { Off, Place, Level };
+/** Image path; spectral targets remain explicit alternatives to the phase map. */
+enum class ImageTarget { Off, Place, Level, Phase };
 
 /**
  * Fixed-latency image spatializer.
  *
- * A 2048-sample, four-times-overlapped STFT maps logarithmic frequency to the
- * projected image. Processing is allocation-free after prepare(). Dry is
- * delayed by the same fixed latency, so Dry/Wet remains phase-aligned.
+ * Phase scans the full brightness-weighted image in source-driven L/R space.
+ * Place/Level use a 2048-sample, four-times-overlapped spectral alternative.
+ * Both paths and Dry have the same fixed latency. No allocation after prepare.
  */
 class ImageSpatializer {
 public:
@@ -36,8 +37,9 @@ public:
 
     struct Parameters {
         PlaneTransform plane;
-        ImageTarget target = ImageTarget::Place;
-        float imageAmount = 0.7f;
+        ImageTarget target = ImageTarget::Phase;
+        PhaseProjection phaseProjection = PhaseProjection::Cartesian;
+        float imageAmount = 1.0f;
         float wet = 1.0f;
     };
 
@@ -65,7 +67,7 @@ private:
     RowTarget rowForFrequency(double normalizedFrequency) const;
     static void spatialize(std::complex<double> left, std::complex<double> right, double signedWidth,
                            double basePosition, const RowTarget& row,
-                           const std::array<double, 3>& targetWeights, double amount,
+                           const std::array<double, 4>& targetWeights, double amount,
                            std::complex<double>& outputLeft, std::complex<double>& outputRight);
 
     double sampleRate_ = 48000.0;
@@ -88,7 +90,19 @@ private:
     const ImageMask* targetMaskIdentity_ = nullptr;
     double maskPresence_ = 0.0;
     double targetMaskPresence_ = 0.0;
-    std::array<double, 3> targetWeights_ {0.0, 1.0, 0.0};
+    std::array<double, 4> targetWeights_ {0.0, 0.0, 0.0, 1.0};
+    ProjectedPlane phasePlane_;
+    ProjectedPlane phasePlaneCurrent_;
+    std::array<ImageMask::ScanPoint, ImageMask::kScanSize> previousScan_ {};
+    float scanFrameBlend_ = 1.0f;
+    double scanPhase_ = 0.0;
+    float scanPresence_ = 0.0f;
+    float sourceEnvelope_ = 0.0f;
+    float sourceRelease_ = 0.0f;
+    float polarMix_ = 0.0f;
+    float dcLeft_ = 0.0f, dcRight_ = 0.0f;
+    float previousPhaseLeft_ = 0.0f, previousPhaseRight_ = 0.0f;
+    float dcPole_ = 0.0f;
     double frameSmoothing_ = 1.0;
     Analysis analysis_;
     float wetCurrent_ = 1.0f;
