@@ -54,7 +54,7 @@ int main()
     processor.loadImageFile(file.getFile());
     check(waitForMask(processor), "image/mask publication timed out");
     const auto mask = processor.imageMask();
-    check(mask != nullptr && mask->hasScan, "native phase trajectory missing");
+    check(mask != nullptr && mask->hasPhasePoints, "native phase distribution missing");
 
     juce::MemoryBlock state;
     processor.getStateInformation(state);

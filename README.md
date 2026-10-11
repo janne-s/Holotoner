@@ -39,18 +39,23 @@ Original image aspect is preserved until you scale the two axes independently.
 
 ## What the image does to audio
 
-Phase map compiles all selected pixels into a brightness-weighted serpentine
-trajectory, away from the audio thread. Source magnitude drives scan travel;
-source polarity and a peak envelope drive its waveform. The projected points
-are converted to L/R samples by the inverse of the Polar Sample mapping.
-A small DC blocker removes offset. This is **source-driven waveform reshaping**,
-not transparent stereo widening or an image pasted over an analyser.
+Phase map compiles a brightness-weighted distribution of the full 2D mask
+off-thread. Fixed image samples define 33 smoothly interpolated phase/stereo
+anchors across 0–16 kHz. Projection controls stereo direction; radius controls
+relative/common phase, NOT audio level. Each frequency uses a unitary mid/side
+rotation after the geometric width baseline. There is no moving image scan,
+polarity-based replacement waveform, amplitude envelope or free-running sound.
 
-The result can reveal a recognizable image with sustained material. It is not
-a promise that any photograph remains perfectly recognizable with any music:
-source dynamics, Dry/Wet, Amount, clipping, map transitions and DC rejection
-all affect the measured figure. Silence does not drive a free-running sound.
-Start playback at a comfortable listening level.
+The source spectrum and dynamics remain the audio material. At rest the image
+defines a static spectral phase field; changing image, geometry or projection
+smooths the coefficients over 20 ms. Geometric narrowing can remove side energy,
+and partial Dry/Wet can cause phase cancellation; those are not tremolo.
+
+The faint projected image is a spatial target, not a promise of pixel-perfect
+audio reproduction. A single sine produces a line/ellipse; broadband material
+reveals more of the image-derived field. The output shape can be less literal
+than the former waveform scanner. No fake image points are added to the measured
+output to compensate for this. Listening judgment remains necessary.
 
 The analyser folds negative sample polarity into the upper semicircle.
 Direction follows the L/R relationship; radius follows sample level on a
@@ -67,8 +72,10 @@ All paths, including Dry, use the same 2047-sample latency.
 
 Image import accepts PNG, JPEG and GIF off-thread. Images are normalized and
 embedded in versioned session state, so the original file is not required to
-reopen a session. State version 4 adds projection, threshold and B/W; versions
-2–3 remain readable and retain their original spectral target. Media stays local.
+reopen a session. State version 5 replaces the unreleased waveform scanner with
+the spatial phase field. Versions 2–4 remain readable with their images and
+controls; old Phase map sessions use the corrected DSP, not the rejected scanner.
+Media stays local.
 
 ## Repository and verification
 
@@ -90,9 +97,12 @@ ctest --test-dir build/core-release --output-on-failure
 
 The core tests cover 44.1/48/96 kHz, blocks 1/31/97/512, exact delayed Dry,
 geometry endpoints, mono-to-stereo, silence, deterministic masks and image
-changes. Phase-map tests also invert actual L/R samples back into scope
-coordinates and check that at least 70% of the measured test figure falls
-within two mask pixels of its source.
+changes. Phase-map tests verify source linearity, stereo power, and pure-tone
+purity/stability at 110/440/1760/7040 Hz across all three sample rates. Residual
+energy outside the original tone must be below −50 dB and fitted stereo power
+modulation below 0.5%; power must stay within 2% at the centred mono-input test.
+These replace the old scanner's pixel-occupancy criterion: spatial sound takes
+priority over exact waveform drawing.
 
 Run the GUI/native harness in a desktop session; it does not open an audio device:
 
@@ -107,10 +117,10 @@ sample history, and renders a diagnostic editor image to
 test data, not a bundled demo.
 
 Standalone, VST3 and AU build as universal arm64/x86_64 binaries. VST3 passes
-pluginval strictness 5. An arm64 Release measurement on 11 October 2026 rendered
-60 seconds of the native Phase map, including sample history, in 0.56 seconds
-(0.94% of one real-time stream's wall-clock budget on this machine).
-This is not a cross-device performance guarantee.
+pluginval strictness 5. The native harness measured 60 seconds of Phase map,
+including sample history, in 0.58 seconds on 11 October 2026 (about 0.97% of
+one real-time stream's wall-clock budget). Timings are machine-specific, not
+a cross-device performance guarantee.
 
 The browser application, licensed demo loop and user listening validation
 remain development work before the first tagged release.

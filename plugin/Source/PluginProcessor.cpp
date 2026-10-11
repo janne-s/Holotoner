@@ -10,7 +10,7 @@
 
 namespace {
 
-constexpr int kStateVersion = 4;
+constexpr int kStateVersion = 5;
 constexpr int kOldestReadableStateVersion = 2;
 constexpr juce::int64 kMaximumImageFileBytes = 32 * 1024 * 1024;
 constexpr int kMaximumImageDimension = 1024;

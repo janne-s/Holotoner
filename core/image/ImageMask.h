@@ -33,12 +33,12 @@ struct ImageMaskSettings {
 
 /** Fixed-size immutable-by-convention data suitable for audio-thread handoff. */
 struct ImageMask {
-    struct ScanPoint { float x = 0.0f; float y = 0.0f; };
-    static constexpr std::size_t kScanSize = 8192;
+    struct PhasePoint { float x = 0.0f; float y = 0.0f; };
+    static constexpr std::size_t kPhasePointCount = 8192;
     std::array<float, static_cast<std::size_t>(kImageMaskWidth * kImageMaskHeight)> values {};
-    // Brightness-weighted serpentine trajectory, compiled OFF the audio thread.
-    std::array<ScanPoint, kScanSize> scan {};
-    bool hasScan = false;
+    // Brightness-weighted quantiles of the complete 2D mask, compiled OFF-thread.
+    std::array<PhasePoint, kPhasePointCount> phasePoints {};
+    bool hasPhasePoints = false;
     float aspectX = 1.0f, aspectY = 1.0f;
     bool hasSource = false;
 

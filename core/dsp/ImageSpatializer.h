@@ -18,7 +18,7 @@ enum class ImageTarget { Off, Place, Level, Phase };
 /**
  * Fixed-latency image spatializer.
  *
- * Phase scans the full brightness-weighted image in source-driven L/R space.
+ * Phase applies a static image-derived unitary mid/side spectral transform.
  * Place/Level use a 2048-sample, four-times-overlapped spectral alternative.
  * Both paths and Dry have the same fixed latency. No allocation after prepare.
  */
@@ -91,18 +91,13 @@ private:
     double maskPresence_ = 0.0;
     double targetMaskPresence_ = 0.0;
     std::array<double, 4> targetWeights_ {0.0, 0.0, 0.0, 1.0};
-    ProjectedPlane phasePlane_;
-    ProjectedPlane phasePlaneCurrent_;
-    std::array<ImageMask::ScanPoint, ImageMask::kScanSize> previousScan_ {};
-    float scanFrameBlend_ = 1.0f;
-    double scanPhase_ = 0.0;
-    float scanPresence_ = 0.0f;
-    float sourceEnvelope_ = 0.0f;
-    float sourceRelease_ = 0.0f;
-    float polarMix_ = 0.0f;
-    float dcLeft_ = 0.0f, dcRight_ = 0.0f;
-    float previousPhaseLeft_ = 0.0f, previousPhaseRight_ = 0.0f;
-    float dcPole_ = 0.0f;
+    struct PhaseControls { double angle = 0.0, relative = 0.0, common = 0.0; };
+    static constexpr std::size_t kPhaseAnchors = 33;
+    std::array<PhaseControls, kPhaseAnchors> phaseControls_ {};
+    bool phaseInitialized_ = false;
+    void buildPhaseControls(const ProjectedPlane&);
+    void applyPhase(std::size_t bin, std::complex<double> left, std::complex<double> right,
+                    double signedWidth, std::complex<double>& outLeft, std::complex<double>& outRight) const;
     double frameSmoothing_ = 1.0;
     Analysis analysis_;
     float wetCurrent_ = 1.0f;

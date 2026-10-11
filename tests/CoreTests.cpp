@@ -498,14 +498,9 @@ holotoner::ImageMask phaseFixture(bool mirror)
 
 void phaseMapCoordinatesAreActualAudio()
 {
-    for (const auto point : {holotoner::ScopePoint {-0.4f, 0.6f}, {0.3f, 0.4f}, {0.0f, 0.8f}}) {
-        const auto audio = holotoner::scopePointToStereo(point);
-        for (const auto sign : {-1.0f, 1.0f}) {
-            const auto measured = holotoner::stereoToScopePoint(sign * audio.left, sign * audio.right);
-            expectNear(measured.x, point.x, 2.0e-6f, "actual Polar Sample x inverse");
-            expectNear(measured.y, point.y, 2.0e-6f, "actual Polar Sample y inverse");
-        }
-    }
+    const auto mono = holotoner::stereoToScopePoint(1.0f, 1.0f);
+    expectNear(mono.x, 0.0f, 1.0e-6f, "actual mono direction");
+    expectNear(mono.y, 1.0f, 1.0e-6f, "actual full-scale radius");
     holotoner::PlaneTransform transform;
     transform.scaleX = transform.scaleY = 2.0f;
     const auto plane = holotoner::projectPlane(transform);
@@ -518,10 +513,10 @@ void phaseMapCoordinatesAreActualAudio()
     const auto b = holotoner::phaseMapPoint(plane, 0.2f, 0.0f, holotoner::PhaseProjection::Cartesian);
     expectNear(a.y, b.y, 0.0f, "cartesian edges stay straight");
     const auto mask = phaseFixture(false);
-    for (const auto point : mask.scan) {
+    for (const auto point : mask.phasePoints) {
         const auto x = static_cast<int>(std::lround((point.x + 1.0f) * 31.5f));
         const auto y = static_cast<int>(std::lround((1.0f - point.y) * 31.5f));
-        expectNear(mask.at(x, y), 1.0f, 0.0f, "binary trajectory visits only selected pixels");
+        expectNear(mask.at(x, y), 1.0f, 0.0f, "binary distribution visits only selected pixels");
     }
 }
 
@@ -529,8 +524,8 @@ void phaseImageProcessing(double sampleRate)
 {
     const auto mask = phaseFixture(false);
     const auto other = phaseFixture(true);
-    if (!mask.hasScan || !other.hasScan) {
-        std::cerr << "phase map trajectory missing\n";
+    if (!mask.hasPhasePoints || !other.hasPhasePoints) {
+        std::cerr << "phase map distribution missing\n";
         ++failures;
     }
     constexpr std::size_t count = 65536;
@@ -559,7 +554,6 @@ void phaseImageProcessing(double sampleRate)
         at += length;
     }
     double difference = 0.0, stereo = 0.0;
-    int matches = 0, measured = 0;
     for (std::size_t i = 0; i < count; ++i) {
         expectNear(splitL[i], wholeL[i], 0.0f, "phase block independence left");
         expectNear(splitR[i], wholeR[i], 0.0f, "phase block independence right");
@@ -573,22 +567,10 @@ void phaseImageProcessing(double sampleRate)
             continue;
         difference += std::pow(wholeL[i] - otherL[i], 2);
         stereo += std::pow(wholeL[i] - wholeR[i], 2);
-        const auto point = holotoner::stereoToScopePoint(wholeL[i] * 5.0f, wholeR[i] * 5.0f);
-        const auto x = static_cast<int>(std::lround((point.x / 0.4f + 1.0f) * 31.5f));
-        const auto y = static_cast<int>(std::lround((1.0f - (point.y - 0.5f) / 0.4f) * 31.5f));
-        ++measured;
-        bool near = false;
-        for (int dy = -2; dy <= 2; ++dy)
-            for (int dx = -2; dx <= 2; ++dx)
-                near = near || mask.at(x + dx, y + dy) > 0.5f;
-        matches += near ? 1 : 0;
+
     }
     if (difference < 0.01 || stereo < 0.01) {
         std::cerr << "phase image changes did not affect audio/stereo\n";
-        ++failures;
-    }
-    if (matches < measured * 7 / 10) {
-        std::cerr << "actual audio did not reproduce image field: " << matches << '/' << measured << '\n';
         ++failures;
     }
     parameters.plane.yawDegrees = 180.0f;
@@ -611,6 +593,72 @@ void phaseImageProcessing(double sampleRate)
     whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &mask);
     for (std::size_t i = count - 512; i < count; ++i)
         expectNear(wholeL[i], 0.0f, 1.0e-5f, "phase silence does not self-generate");
+}
+
+void phasePreservesTone(double sampleRate, double hz, bool stereo = false)
+{
+    const auto mask = phaseFixture(false);
+    constexpr std::size_t count = 65536;
+    std::vector<float> left(count), right(count);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const auto angle = 2.0 * 3.141592653589793 * hz * static_cast<double>(i) / sampleRate;
+        left[i] = static_cast<float>(0.2 * std::sin(angle));
+        right[i] = static_cast<float>(0.2 * (stereo ? std::cos(angle) : std::sin(angle)));
+    }
+    holotoner::ImageSpatializer engine;
+    holotoner::ImageSpatializer::Parameters parameters;
+    parameters.plane.scaleX = parameters.plane.scaleY = 1.0f;
+    engine.setParameters(parameters);
+    engine.prepare(sampleRate);
+    engine.process(left.data(), right.data(), static_cast<int>(count), &mask);
+    double minimum = 1.0e9, maximum = 0.0, residual = 0.0, total = 0.0;
+    for (std::size_t start = 32768; start + 2048 <= count; start += 2048) {
+        double power = 0.0;
+        for (const auto* channel : {left.data(), right.data()}) {
+            double ss = 0.0, cc = 0.0, sc = 0.0, ys = 0.0, yc = 0.0, yy = 0.0;
+            for (std::size_t i = start; i < start + 2048; ++i) {
+                const auto angle = 2.0 * 3.141592653589793 * hz * static_cast<double>(i) / sampleRate;
+                const auto s = std::sin(angle), c = std::cos(angle), y = static_cast<double>(channel[i]);
+                ss += s*s; cc += c*c; sc += s*c; ys += y*s; yc += y*c; yy += y*y;
+            }
+            const auto determinant = ss * cc - sc * sc;
+            const auto a = (ys * cc - yc * sc) / determinant;
+            const auto b = (yc * ss - ys * sc) / determinant;
+            power += a*a + b*b;
+            residual += std::max(0.0, yy - a*ys - b*yc);
+            total += yy;
+        }
+        minimum = std::min(minimum, power);
+        maximum = std::max(maximum, power);
+    }
+    std::cout << "Phase tone " << sampleRate << "/" << hz << ": residual "
+              << residual/total << ", power modulation " << (maximum-minimum)/maximum << '\n';
+    if (residual / std::max(total, 1.0e-20) > 0.00001
+        || (maximum - minimum) / std::max(maximum, 1.0e-20) > 0.005) {
+        std::cerr << "phase tone changed/pumped at " << sampleRate << "/" << hz
+                  << ": residual " << residual/total << ", modulation "
+                  << (maximum-minimum)/maximum << '\n';
+        ++failures;
+    }
+    // Unity stereo power for a centred, full-width phase field.
+    if (std::abs(0.5 * (minimum + maximum) / 0.08 - 1.0) > 0.02) {
+        std::cerr << "phase tone stereo energy changed at " << hz << '\n';
+        ++failures;
+    }
+    // Fixed map must be linear in the source, not a polarity/envelope generator.
+    auto halfL = left, halfR = right;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto angle = 2.0 * 3.141592653589793 * hz * static_cast<double>(i) / sampleRate;
+        halfL[i] = static_cast<float>(0.1 * std::sin(angle));
+        halfR[i] = static_cast<float>(0.1 * (stereo ? std::cos(angle) : std::sin(angle)));
+    }
+    engine.prepare(sampleRate);
+    engine.process(halfL.data(), halfR.data(), static_cast<int>(count), &mask);
+    for (std::size_t i = 32768; i < count; ++i) {
+        expectNear(halfL[i], 0.5f * left[i], 1.0e-6f, "phase source linearity left");
+        expectNear(halfR[i], 0.5f * right[i], 1.0e-6f, "phase source linearity right");
+    }
 }
 
 } // namespace
@@ -637,6 +685,10 @@ int main()
     phaseImageProcessing(44100.0);
     phaseImageProcessing(48000.0);
     phaseImageProcessing(96000.0);
+    for (const auto rate : {44100.0, 48000.0, 96000.0})
+        for (const auto hz : {110.0, 440.0, 1760.0, 7040.0})
+            phasePreservesTone(rate, hz);
+    phasePreservesTone(48000.0, 440.0, true);
     if (failures != 0)
         std::cerr << failures << " test assertion(s) failed\n";
     return failures == 0 ? 0 : 1;

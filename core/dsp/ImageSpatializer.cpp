@@ -40,8 +40,6 @@ void ImageSpatializer::prepare(double sampleRate)
         value *= scale;
     frameSmoothing_ = 1.0 - std::exp(-static_cast<double>(kHopSize) / (0.02 * sampleRate_));
     wetRate_ = static_cast<float>(1.0 - std::exp(-1.0 / (0.02 * sampleRate_)));
-    sourceRelease_ = static_cast<float>(std::exp(-1.0 / (0.06 * sampleRate_)));
-    dcPole_ = static_cast<float>(std::exp(-2.0 * std::numbers::pi * 5.0 / sampleRate_));
     reset();
 }
 
@@ -66,14 +64,9 @@ void ImageSpatializer::reset()
     inputAt_ = dryAt_ = outputAt_ = filled_ = sinceHop_ = 0;
     wetCurrent_ = parameters_.wet;
     safetyResets_ = 0;
-    scanPhase_ = 0.0;
-    scanPresence_ = sourceEnvelope_ = dcLeft_ = dcRight_ = 0.0f;
-    previousPhaseLeft_ = previousPhaseRight_ = 0.0f;
-    polarMix_ = parameters_.phaseProjection == PhaseProjection::Polar ? 1.0f : 0.0f;
-    phasePlane_ = projectPlane(parameters_.plane);
-    phasePlaneCurrent_ = phasePlane_;
-    previousScan_.fill({});
-    scanFrameBlend_ = 1.0f;
+    phaseControls_.fill({});
+    phaseInitialized_ = false;
+
 }
 
 void ImageSpatializer::setParameters(Parameters parameters)
@@ -128,46 +121,6 @@ void ImageSpatializer::process(float* left, float* right, int sampleCount, const
         auto wetRight = outputRight_[read];
         outputLeft_[read] = 0.0;
         outputRight_[read] = 0.0;
-        const auto sourceMagnitude = std::max(std::abs(delayedLeft), std::abs(delayedRight));
-        sourceEnvelope_ = std::max(sourceMagnitude, sourceEnvelope_ * sourceRelease_);
-        // The source drives scan travel and polarity; silence cannot generate sound.
-        scanPhase_ += 40.0 * static_cast<double>(sourceMagnitude) / sampleRate_;
-        scanPhase_ -= std::floor(scanPhase_);
-        const auto scanPosition = (scanPhase_ < 0.5 ? 2.0 * scanPhase_ : 2.0 * (1.0 - scanPhase_))
-            * static_cast<double>(ImageMask::kScanSize - 1);
-        const auto at = static_cast<std::size_t>(scanPosition);
-        const auto next = std::min(at + 1, ImageMask::kScanSize - 1);
-        const auto fraction = static_cast<float>(scanPosition - static_cast<double>(at));
-        const auto& a = smoothedMask_.scan[at];
-        const auto& b = smoothedMask_.scan[next];
-        const auto& oldA = previousScan_[at];
-        const auto& oldB = previousScan_[next];
-        const auto oldX = oldA.x + fraction * (oldB.x - oldA.x);
-        const auto oldY = oldA.y + fraction * (oldB.y - oldA.y);
-        scanFrameBlend_ = std::min(1.0f, scanFrameBlend_ + 1.0f / static_cast<float>(kHopSize));
-        const auto x = oldX + scanFrameBlend_ * (a.x + fraction * (b.x - a.x) - oldX);
-        const auto y = oldY + scanFrameBlend_ * (a.y + fraction * (b.y - a.y) - oldY);
-        for (std::size_t corner = 0; corner < phasePlane_.corners.size(); ++corner) {
-            auto& current = phasePlaneCurrent_.corners[corner];
-            const auto& target = phasePlane_.corners[corner];
-            current.stereo += wetRate_ * (target.stereo - current.stereo);
-            current.frequency += wetRate_ * (target.frequency - current.frequency);
-        }
-        polarMix_ += wetRate_ * ((parameters_.phaseProjection == PhaseProjection::Polar ? 1.0f : 0.0f) - polarMix_);
-        const auto cartesian = scopePointToStereo(phaseMapPoint(phasePlaneCurrent_, x, y, PhaseProjection::Cartesian));
-        const auto polar = scopePointToStereo(phaseMapPoint(phasePlaneCurrent_, x, y, PhaseProjection::Polar));
-        const auto carrier = std::abs(delayedLeft) >= std::abs(delayedRight) ? delayedLeft : delayedRight;
-        const auto gain = sourceMagnitude > 1.0e-7f
-            ? std::min(sourceEnvelope_, 1.0f) * (carrier >= 0.0f ? 1.0f : -1.0f) * scanPresence_ : 0.0f;
-        const auto phaseLeft = gain * (cartesian.left + polarMix_ * (polar.left - cartesian.left));
-        const auto phaseRight = gain * (cartesian.right + polarMix_ * (polar.right - cartesian.right));
-        dcLeft_ = phaseLeft - previousPhaseLeft_ + dcPole_ * dcLeft_;
-        dcRight_ = phaseRight - previousPhaseRight_ + dcPole_ * dcRight_;
-        previousPhaseLeft_ = phaseLeft;
-        previousPhaseRight_ = phaseRight;
-        const auto phaseWeight = targetWeights_[3] * maskPresence_ * smoothedParameters_.imageAmount;
-        wetLeft += phaseWeight * (static_cast<double>(dcLeft_) - wetLeft);
-        wetRight += phaseWeight * (static_cast<double>(dcRight_) - wetRight);
         wetCurrent_ += (parameters_.wet - wetCurrent_) * wetRate_;
         const auto outLeft = static_cast<double>(delayedLeft) + static_cast<double>(wetCurrent_)
             * (wetLeft - static_cast<double>(delayedLeft));
@@ -191,7 +144,7 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     auto phaseTransform = smoothedParameters_.plane;
     phaseTransform.scaleX *= targetMask_.aspectX;
     phaseTransform.scaleY *= targetMask_.aspectY;
-    phasePlane_ = projectPlane(phaseTransform);
+    buildPhaseControls(projectPlane(phaseTransform));
     buildRows(projection);
     for (std::size_t i = 0; i < kFftSize; ++i) {
         const auto at = (inputAt_ + i) % kFftSize;
@@ -222,6 +175,7 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
         std::complex<double> outLeft, outRight;
         spatialize(inLeft, inRight, signedWidth, basePosition, row, targetWeights_,
                    smoothedParameters_.imageAmount, outLeft, outRight);
+        applyPhase(k, inLeft, inRight, signedWidth, outLeft, outRight);
         const auto analysisWet = static_cast<double>(wetCurrent_);
         const auto analysisOutLeft = inLeft + analysisWet * (outLeft - inLeft);
         const auto analysisOutRight = inRight + analysisWet * (outRight - inRight);
@@ -302,19 +256,70 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     smooth(smoothedParameters_.imageAmount, parameters_.imageAmount);
     for (std::size_t i = 0; i < smoothedMask_.values.size(); ++i)
         smooth(smoothedMask_.values[i], targetMask_.values[i]);
-    previousScan_ = smoothedMask_.scan;
-    scanFrameBlend_ = 0.0f;
-    if (targetMask_.hasScan)
-        for (std::size_t i = 0; i < ImageMask::kScanSize; ++i) {
-            smooth(smoothedMask_.scan[i].x, targetMask_.scan[i].x);
-            smooth(smoothedMask_.scan[i].y, targetMask_.scan[i].y);
-        }
-    smooth(scanPresence_, targetMask_.hasScan ? 1.0f : 0.0f);
     smooth(maskPresence_, targetMaskPresence_);
     smoothedMask_.hasSource = maskPresence_ > 1.0e-6;
     const auto selectedTarget = static_cast<std::size_t>(parameters_.target);
     for (std::size_t i = 0; i < targetWeights_.size(); ++i)
         smooth(targetWeights_[i], i == selectedTarget ? 1.0 : 0.0);
+}
+
+void ImageSpatializer::buildPhaseControls(const ProjectedPlane& projection)
+{
+    const auto smooth = phaseInitialized_ ? frameSmoothing_ : 1.0;
+    for (std::size_t i = 0; i < kPhaseAnchors; ++i) {
+        // Fixed frequency assignment, never advanced by time, pitch or source level.
+        const auto index = (i * 4051 + 2053) % ImageMask::kPhasePointCount;
+        const auto& pixel = targetMask_.phasePoints[index];
+        const auto point = phaseMapPoint(projection, pixel.x, pixel.y, parameters_.phaseProjection);
+        const auto radius = std::hypot(point.x, point.y);
+        PhaseControls target;
+        if (targetMask_.hasPhasePoints && point.y >= 0.0f && radius <= 1.0f) {
+            target.angle = std::clamp(static_cast<double>(std::atan2(point.x, std::max(point.y, 0.08f))),
+                                      -1.25, 1.25);
+            target.relative = std::numbers::pi * 0.75 * std::clamp(1.0 - radius, 0.0, 1.0);
+            target.common = std::numbers::pi * 0.6 * (radius - 0.5);
+        }
+        auto& current = phaseControls_[i];
+        current.angle += smooth * (target.angle - current.angle);
+        current.relative += smooth * (target.relative - current.relative);
+        current.common += smooth * (target.common - current.common);
+    }
+    phaseInitialized_ = true;
+}
+
+void ImageSpatializer::applyPhase(std::size_t bin, std::complex<double> left, std::complex<double> right,
+                                  double signedWidth, std::complex<double>& outLeft,
+                                  std::complex<double>& outRight) const
+{
+    const auto amount = targetWeights_[3] * maskPresence_ * smoothedParameters_.imageAmount;
+    if (amount < 1.0e-9)
+        return;
+    const auto hz = static_cast<double>(bin) * sampleRate_ / static_cast<double>(kFftSize);
+    const auto position = std::min(1.0, hz / kHighHz) * static_cast<double>(kPhaseAnchors - 1);
+    const auto at = std::min(static_cast<std::size_t>(position), kPhaseAnchors - 2);
+    const auto t = position - static_cast<double>(at);
+    const auto& a = phaseControls_[at];
+    const auto& b = phaseControls_[at + 1];
+    const auto baseAngle = 0.5 * std::asin(std::clamp(
+        static_cast<double>(smoothedParameters_.plane.positionX), -1.0, 1.0));
+    const auto angle = baseAngle + amount * (a.angle + t * (b.angle - a.angle) - baseAngle);
+    const auto relative = amount * (a.relative + t * (b.relative - a.relative));
+    const auto common = amount * (a.common + t * (b.common - a.common));
+    const auto c = std::cos(angle);
+    const auto s = std::sin(angle);
+    const auto phase = std::polar(1.0, relative);
+    const auto mid = 0.5 * (left + right);
+    const auto side = 0.5 * signedWidth * (right - left);
+    // Unitary rotation: no pixel-derived gain envelope and no replacement carrier.
+    const auto mappedMid = c * mid - s * std::conj(phase) * side;
+    const auto mappedSide = s * phase * mid + c * side;
+    const auto sharedPhase = std::polar(1.0, common);
+    const auto mappedLeft = sharedPhase * (mappedMid - mappedSide);
+    const auto mappedRight = sharedPhase * (mappedMid + mappedSide);
+    // The image path smoothly replaces other targets during target automation.
+    const auto mix = targetWeights_[3];
+    outLeft += mix * (mappedLeft - outLeft);
+    outRight += mix * (mappedRight - outRight);
 }
 
 void ImageSpatializer::buildRows(const ProjectedPlane& projection)

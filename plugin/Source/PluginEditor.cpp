@@ -724,7 +724,7 @@ void HolotonerEditor::refresh()
     if (image != nullptr)
         message += "    Image: " + image->name;
     if (target_.getSelectedId() == 4)
-        message += "    Phase map reshapes the waveform; source level changes its reach.";
+        message += "    Image phase field; source spectrum drives the measured shape.";
     else
         message += "    Polar measures audio; image gestures are automatable.";
     status_.setText(message, juce::dontSendNotification);

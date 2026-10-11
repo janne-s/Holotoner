@@ -139,23 +139,23 @@ ImageMask buildImageMask(const RgbaImage& image, ImageMaskSettings settings)
     for (const auto value : result.values)
         total += value;
     if (total > 1.0e-9) {
-        result.hasScan = true;
+        result.hasPhasePoints = true;
         std::size_t cursor = 0;
         double accumulated = 0.0;
         for (int y = 0; y < kImageMaskHeight; ++y)
             for (int column = 0; column < kImageMaskWidth; ++column) {
                 const auto x = (y % 2 == 0) ? column : kImageMaskWidth - 1 - column;
                 accumulated += result.at(x, y);
-                while (cursor < result.scan.size()
+                while (cursor < result.phasePoints.size()
                        && total * (static_cast<double>(cursor) + 0.5)
-                              / static_cast<double>(result.scan.size()) <= accumulated) {
-                    result.scan[cursor++] = {
+                              / static_cast<double>(result.phasePoints.size()) <= accumulated) {
+                    result.phasePoints[cursor++] = {
                         2.0f * static_cast<float>(x) / static_cast<float>(kImageMaskWidth - 1) - 1.0f,
                         1.0f - 2.0f * static_cast<float>(y) / static_cast<float>(kImageMaskHeight - 1)};
                 }
             }
-        while (cursor < result.scan.size()) {
-            result.scan[cursor] = result.scan[cursor - 1];
+        while (cursor < result.phasePoints.size()) {
+            result.phasePoints[cursor] = result.phasePoints[cursor - 1];
             ++cursor;
         }
     }

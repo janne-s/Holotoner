@@ -21,18 +21,6 @@ ScopePoint phaseMapPoint(const ProjectedPlane& plane, float x, float y, PhasePro
     return {horizontal * 0.5f, 0.5f + vertical * 0.5f};
 }
 
-StereoSample scopePointToStereo(ScopePoint point)
-{
-    const auto radius = std::hypot(point.x, point.y);
-    if (!std::isfinite(radius) || radius > 1.0f || point.y < 0.0f || radius < 0.001f)
-        return {};
-    // Inverse of Spectral Space Polar Sample's -60..0 dB radial scale.
-    const auto level = std::pow(10.0f, 3.0f * (radius - 1.0f));
-    const auto mid = level * point.y / radius;
-    const auto side = level * point.x / radius;
-    return {mid - side, mid + side};
-}
-
 ScopePoint stereoToScopePoint(float left, float right)
 {
     if (!std::isfinite(left) || !std::isfinite(right))
