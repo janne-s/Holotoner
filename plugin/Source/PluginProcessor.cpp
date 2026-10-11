@@ -13,6 +13,8 @@ constexpr int kStateVersion = 3;
 constexpr int kOldestReadableStateVersion = 2;
 constexpr juce::int64 kMaximumImageFileBytes = 32 * 1024 * 1024;
 constexpr int kMaximumImageDimension = 1024;
+static_assert(std::atomic<float>::is_always_lock_free);
+static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
 
 juce::String sourceKindKey(holotoner::SourceKind kind)
 {
@@ -180,6 +182,13 @@ void HolotonerProcessor::prepareToPlay(double sampleRate, int)
     outputLeft_.store(0.0f, std::memory_order_relaxed);
     outputRight_.store(0.0f, std::memory_order_relaxed);
     outputCorrelation_.store(0.0f, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < holotoner::ImageSpatializer::kAnalysisBins; ++i) {
+        analysisLevel_[i].store(0.0f, std::memory_order_relaxed);
+        analysisBalance_[i].store(0.0f, std::memory_order_relaxed);
+        analysisCorrelation_[i].store(0.0f, std::memory_order_relaxed);
+    }
+    analysisSequence_.store(0, std::memory_order_release);
+    publishedAnalysisRevision_ = 0;
 }
 
 bool HolotonerProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -244,6 +253,18 @@ void HolotonerProcessor::processBlock(juce::AudioBuffer<float>& audio, juce::Mid
     const auto* mask = masks_.acquire();
     masks_.hold(0, mask);
     engine_.process(audio.getWritePointer(0), audio.getWritePointer(1), samples, mask);
+    const auto& analysis = engine_.analysis();
+    if (analysis.revision != publishedAnalysisRevision_) {
+        const auto sequence = 2 * analysis.revision;
+        analysisSequence_.store(sequence - 1, std::memory_order_seq_cst);
+        for (std::size_t i = 0; i < holotoner::ImageSpatializer::kAnalysisBins; ++i) {
+            analysisLevel_[i].store(analysis.level[i], std::memory_order_relaxed);
+            analysisBalance_[i].store(analysis.balance[i], std::memory_order_relaxed);
+            analysisCorrelation_[i].store(analysis.correlation[i], std::memory_order_relaxed);
+        }
+        analysisSequence_.store(sequence, std::memory_order_release);
+        publishedAnalysisRevision_ = analysis.revision;
+    }
     const auto outputMeter = measureBlock(audio.getReadPointer(0), audio.getReadPointer(1), samples);
     meterOutputLeft_ = std::max(outputMeter.left, meterOutputLeft_ * meterDecay);
     meterOutputRight_ = std::max(outputMeter.right, meterOutputRight_ * meterDecay);
@@ -266,6 +287,27 @@ HolotonerProcessor::MeterState HolotonerProcessor::meterState() const
     return {inputLeft_.load(std::memory_order_relaxed), inputRight_.load(std::memory_order_relaxed),
             outputLeft_.load(std::memory_order_relaxed), outputRight_.load(std::memory_order_relaxed),
             outputCorrelation_.load(std::memory_order_relaxed)};
+}
+
+holotoner::ImageSpatializer::Analysis HolotonerProcessor::polarAnalysis() const
+{
+    holotoner::ImageSpatializer::Analysis result;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto before = analysisSequence_.load(std::memory_order_acquire);
+        if ((before & 1U) != 0)
+            continue;
+        for (std::size_t i = 0; i < holotoner::ImageSpatializer::kAnalysisBins; ++i) {
+            result.level[i] = analysisLevel_[i].load(std::memory_order_relaxed);
+            result.balance[i] = analysisBalance_[i].load(std::memory_order_relaxed);
+            result.correlation[i] = analysisCorrelation_[i].load(std::memory_order_relaxed);
+        }
+        const auto after = analysisSequence_.load(std::memory_order_acquire);
+        if (before == after) {
+            result.revision = after / 2;
+            return result;
+        }
+    }
+    return result;
 }
 
 juce::AudioProcessorEditor* HolotonerProcessor::createEditor()

@@ -64,6 +64,7 @@ public:
     juce::AudioProcessorValueTreeState& state() { return parameters_; }
     holotoner::PlaneTransform planeTransform() const;
     MeterState meterState() const;
+    holotoner::ImageSpatializer::Analysis polarAnalysis() const;
 
     void setSourceKind(holotoner::SourceKind kind) { sourceKind_.store(static_cast<int>(kind)); }
     holotoner::SourceKind sourceKind() const
@@ -124,6 +125,11 @@ private:
     float meterOutputLeft_ = 0.0f;      ///< audio thread
     float meterOutputRight_ = 0.0f;     ///< audio thread
     float meterDecayPerSample_ = 0.0f;  ///< audio thread
+    std::array<std::atomic<float>, holotoner::ImageSpatializer::kAnalysisBins> analysisLevel_ {};
+    std::array<std::atomic<float>, holotoner::ImageSpatializer::kAnalysisBins> analysisBalance_ {};
+    std::array<std::atomic<float>, holotoner::ImageSpatializer::kAnalysisBins> analysisCorrelation_ {};
+    std::atomic<std::uint64_t> analysisSequence_ {0};
+    std::uint64_t publishedAnalysisRevision_ = 0; ///< audio thread
 
     holotoner::SourcePlayer sourcePlayer_;
     holotoner::SharedExchange<holotoner::SourceAudio> sources_;

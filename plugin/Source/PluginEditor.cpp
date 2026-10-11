@@ -346,10 +346,12 @@ public:
         graphics.strokePath(plane, juce::PathStrokeType(1.2f));
 
         const auto meters = processor_.meterState();
+        const auto latestAnalysis = processor_.polarAnalysis();
+        if (latestAnalysis.revision != 0)
+            analysis_ = latestAnalysis;
+        drawSpectralOutput(graphics, centre, radius, analysis_);
         drawMeter(graphics, centre, radius, meters.inputLeft, meters.inputRight,
                   style::textDim.withAlpha(0.65f), 3.0f);
-        drawMeter(graphics, centre, radius, meters.outputLeft, meters.outputRight,
-                  style::signal, 4.5f);
         graphics.restoreState();
 
         graphics.setColour(style::text);
@@ -374,6 +376,36 @@ public:
     }
 
 private:
+    static void drawSpectralOutput(juce::Graphics& graphics, juce::Point<float> centre,
+                                   float maximumRadius, const holotoner::ImageSpatializer::Analysis& analysis)
+    {
+        constexpr auto bins = holotoner::ImageSpatializer::kAnalysisBins;
+        for (std::size_t i = 0; i < bins; ++i) {
+            const auto decibels = 20.0f * std::log10(std::max(analysis.level[i], 1.0e-6f));
+            const auto visibility = clamp((decibels + 60.0f) / 60.0f, 0.0f, 1.0f);
+            if (visibility <= 0.01f)
+                continue;
+            const auto frequency = (static_cast<float>(i) + 0.5f) / static_cast<float>(bins);
+            const auto radius = maximumRadius * (0.25f + 0.70f * frequency);
+            const auto balance = clamp(analysis.balance[i], -1.0f, 1.0f);
+            const auto correlation = clamp(analysis.correlation[i], -1.0f, 1.0f);
+            const auto centreDegrees = -90.0f + 60.0f * balance;
+            const auto halfSpreadDegrees = 28.0f * std::sqrt(0.5f * (1.0f - correlation));
+            const auto pointAt = [centre, radius](float degrees) {
+                const auto angle = degrees * pi / 180.0f;
+                return juce::Point<float> {centre.x + radius * std::cos(angle),
+                                           centre.y + radius * std::sin(angle)};
+            };
+            const auto left = pointAt(centreDegrees - halfSpreadDegrees);
+            const auto right = pointAt(centreDegrees + halfSpreadDegrees);
+            const auto point = pointAt(centreDegrees);
+            graphics.setColour(style::signal.withAlpha(0.10f + 0.58f * visibility));
+            graphics.drawLine(juce::Line<float>(left, right), 0.75f + 2.0f * visibility);
+            const auto diameter = 2.0f + 4.0f * visibility;
+            graphics.fillEllipse(juce::Rectangle<float>(diameter, diameter).withCentre(point));
+        }
+    }
+
     void drawMask(juce::Graphics& graphics, juce::Point<float> centre, float radius,
                   const ProjectedPlane& projected) const
     {
@@ -418,6 +450,7 @@ private:
 
     HolotonerProcessor& processor_;
     holotoner::ImageMask mask_;
+    holotoner::ImageSpatializer::Analysis analysis_;
     bool hasMask_ = false;
 };
 

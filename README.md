@@ -69,8 +69,11 @@ image spatializer. Its Standalone target starts with test clicks and supports
 an off-thread audio-file loader, host-transport-aware playback and common
 source controls. Its editor uses the intended side-by-side interaction: an
 automatable image plane controls the canonical transform, while a read-only
-polar panel shows the same projection, selected mask, input/output level and
-output correlation.
+polar panel shows the same projection and selected mask behind a real-time
+64-band output field. Each output mark maps logarithmic frequency to radius,
+stereo balance to angle, phase correlation to angular spread and level to
+visibility. A neutral input meter and the output correlation bar remain as
+references.
 
 Image import accepts PNG, JPEG and GIF away from the audio thread, bounds and
 normalizes the image, embeds it in session state, and publishes a fixed 64 x 64
@@ -95,9 +98,10 @@ The VST3 passes pluginval at strictness level 5, including editor, state,
 automation, bus-layout and 44.1/48/96 kHz processing checks.
 
 An arm64 Release measurement on 11 October 2026 rendered 60 seconds of the
-image spatializer at 48 kHz with 512-sample blocks in 0.45 seconds. That is
-0.75% of one real-time stream's wall-clock budget on the test machine; it is a
-development reference, not a cross-device performance guarantee.
+image spatializer and polar analysis at 48 kHz with 512-sample blocks in 0.48
+seconds. That is 0.81% of one real-time stream's wall-clock budget on the test
+machine; it is a development reference, not a cross-device performance
+guarantee.
 
 ## Licence
 

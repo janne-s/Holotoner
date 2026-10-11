@@ -25,6 +25,14 @@ class ImageSpatializer {
 public:
     static constexpr std::size_t kFftSize = 2048;
     static constexpr std::size_t kHopSize = kFftSize / 4;
+    static constexpr std::size_t kAnalysisBins = 64;
+
+    struct Analysis {
+        std::array<float, kAnalysisBins> level {};
+        std::array<float, kAnalysisBins> balance {};
+        std::array<float, kAnalysisBins> correlation {};
+        std::uint64_t revision = 0;
+    };
 
     struct Parameters {
         PlaneTransform plane;
@@ -40,6 +48,7 @@ public:
 
     int latencySamples() const { return static_cast<int>(kFftSize - 1); }
     std::uint32_t takeSafetyResets();
+    const Analysis& analysis() const { return analysis_; }
 
 private:
     struct RowTarget {
@@ -81,6 +90,7 @@ private:
     double targetMaskPresence_ = 0.0;
     std::array<double, 3> targetWeights_ {0.0, 1.0, 0.0};
     double frameSmoothing_ = 1.0;
+    Analysis analysis_;
     float wetCurrent_ = 1.0f;
     float wetRate_ = 1.0f;
     std::uint32_t safetyResets_ = 0;

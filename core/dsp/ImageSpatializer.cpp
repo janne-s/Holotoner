@@ -60,6 +60,7 @@ void ImageSpatializer::reset()
     smoothedParameters_ = parameters_;
     targetWeights_.fill(0.0);
     targetWeights_[static_cast<std::size_t>(parameters_.target)] = 1.0;
+    analysis_ = {};
     inputAt_ = dryAt_ = outputAt_ = filled_ = sinceHop_ = 0;
     wetCurrent_ = parameters_.wet;
     safetyResets_ = 0;
@@ -148,6 +149,10 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     const auto basePosition = static_cast<double>(smoothedParameters_.plane.positionX);
     const std::complex<double> imaginary {0.0, 1.0};
     const auto half = kFftSize / 2;
+    std::array<double, kAnalysisBins> analysisLeft {};
+    std::array<double, kAnalysisBins> analysisRight {};
+    std::array<double, kAnalysisBins> analysisCross {};
+    std::array<std::size_t, kAnalysisBins> analysisCount {};
     for (std::size_t k = 1; k < half; ++k) {
         const auto packed = spectrum_[k];
         const auto mirrored = std::conj(spectrum_[kFftSize - k]);
@@ -161,6 +166,17 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
         std::complex<double> outLeft, outRight;
         spatialize(inLeft, inRight, signedWidth, basePosition, row, targetWeights_,
                    smoothedParameters_.imageAmount, outLeft, outRight);
+        const auto analysisWet = static_cast<double>(wetCurrent_);
+        const auto analysisOutLeft = inLeft + analysisWet * (outLeft - inLeft);
+        const auto analysisOutRight = inRight + analysisWet * (outRight - inRight);
+        const auto analysisAt = std::min(
+            kAnalysisBins - 1,
+            static_cast<std::size_t>(std::clamp(0.5 * (frequency + 1.0), 0.0, 1.0)
+                                     * static_cast<double>(kAnalysisBins)));
+        analysisLeft[analysisAt] += std::norm(analysisOutLeft);
+        analysisRight[analysisAt] += std::norm(analysisOutRight);
+        analysisCross[analysisAt] += std::real(analysisOutLeft * std::conj(analysisOutRight));
+        ++analysisCount[analysisAt];
         spectrum_[k] = outLeft + imaginary * outRight;
         spectrum_[kFftSize - k] = std::conj(outLeft) + imaginary * std::conj(outRight);
     }
@@ -174,6 +190,30 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     }
 
     fft_.transform(spectrum_, true);
+    constexpr double spectrumToAmplitude = 2.0 / static_cast<double>(kFftSize);
+    constexpr float analysisDecay = 0.82f;
+    constexpr float directionSmoothing = 0.35f;
+    for (std::size_t i = 0; i < kAnalysisBins; ++i) {
+        const auto count = static_cast<double>(std::max<std::size_t>(analysisCount[i], 1));
+        const auto leftPower = analysisLeft[i] / count;
+        const auto rightPower = analysisRight[i] / count;
+        const auto leftLevel = std::sqrt(leftPower);
+        const auto rightLevel = std::sqrt(rightPower);
+        const auto measuredLevel = static_cast<float>(
+            spectrumToAmplitude * std::sqrt(0.5 * (leftPower + rightPower)));
+        analysis_.level[i] = std::max(measuredLevel, analysisDecay * analysis_.level[i]);
+        if (leftLevel + rightLevel > kTiny) {
+            const auto measuredBalance = static_cast<float>(
+                std::clamp((rightLevel - leftLevel) / (rightLevel + leftLevel), -1.0, 1.0));
+            const auto denominator = std::sqrt(leftPower * rightPower);
+            const auto measuredCorrelation = static_cast<float>(
+                denominator > kTiny ? std::clamp(analysisCross[i] / count / denominator, -1.0, 1.0) : 0.0);
+            analysis_.balance[i] += directionSmoothing * (measuredBalance - analysis_.balance[i]);
+            analysis_.correlation[i] += directionSmoothing
+                * (measuredCorrelation - analysis_.correlation[i]);
+        }
+    }
+    ++analysis_.revision;
     constexpr auto outputSize = 2 * kFftSize;
     const auto inverseScale = 1.0 / static_cast<double>(kFftSize);
     for (std::size_t i = 0; i < kFftSize; ++i) {

@@ -423,6 +423,29 @@ void imageSpatializerMakesMonoImageStereo()
         std::cerr << "image placement did not make mono input stereo\n";
         ++failures;
     }
+    const auto& analysis = engine.analysis();
+    float analysisPeak = 0.0f;
+    bool showsStereoField = false;
+    for (std::size_t i = 0; i < holotoner::ImageSpatializer::kAnalysisBins; ++i) {
+        analysisPeak = std::max(analysisPeak, analysis.level[i]);
+        showsStereoField = showsStereoField || (analysis.level[i] > 1.0e-4f
+            && (std::abs(analysis.balance[i]) > 0.01f || analysis.correlation[i] < 0.98f));
+        if (!std::isfinite(analysis.level[i]) || !std::isfinite(analysis.balance[i])
+            || !std::isfinite(analysis.correlation[i]) || analysis.level[i] < 0.0f
+            || std::abs(analysis.balance[i]) > 1.0f || std::abs(analysis.correlation[i]) > 1.0f) {
+            std::cerr << "polar analysis escaped finite bounds\n";
+            ++failures;
+            break;
+        }
+    }
+    if (analysis.revision == 0 || analysisPeak < 1.0e-4f) {
+        std::cerr << "polar analysis did not publish output energy\n";
+        ++failures;
+    }
+    if (!showsStereoField) {
+        std::cerr << "polar analysis did not expose the image stereo field\n";
+        ++failures;
+    }
 }
 
 void blackImageCanSilenceLevelTarget()
