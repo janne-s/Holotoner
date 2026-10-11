@@ -9,7 +9,8 @@
 
 namespace {
 
-constexpr int kStateVersion = 2;
+constexpr int kStateVersion = 3;
+constexpr int kOldestReadableStateVersion = 2;
 constexpr juce::int64 kMaximumImageFileBytes = 32 * 1024 * 1024;
 constexpr int kMaximumImageDimension = 1024;
 
@@ -78,11 +79,22 @@ HolotonerProcessor::HolotonerProcessor()
     yaw_ = parameters_.getRawParameterValue("yaw");
     roll_ = parameters_.getRawParameterValue("roll");
     wet_ = parameters_.getRawParameterValue("wet");
+    imageChannel_ = parameters_.getRawParameterValue("image_channel");
+    imageTarget_ = parameters_.getRawParameterValue("image_target");
+    imageGain_ = parameters_.getRawParameterValue("image_gain");
+    imageFill_ = parameters_.getRawParameterValue("image_fill");
+    imageNormalize_ = parameters_.getRawParameterValue("image_normalize");
+    imageInvert_ = parameters_.getRawParameterValue("image_invert");
+    imageAmount_ = parameters_.getRawParameterValue("image_amount");
     jassert(positionX_ != nullptr && positionY_ != nullptr && scaleX_ != nullptr && scaleY_ != nullptr
-            && pitch_ != nullptr && yaw_ != nullptr && roll_ != nullptr && wet_ != nullptr);
+            && pitch_ != nullptr && yaw_ != nullptr && roll_ != nullptr && wet_ != nullptr
+            && imageChannel_ != nullptr && imageTarget_ != nullptr && imageGain_ != nullptr
+            && imageFill_ != nullptr && imageNormalize_ != nullptr && imageInvert_ != nullptr
+            && imageAmount_ != nullptr);
+    setLatencySamples(engine_.latencySamples());
     if (wrapperType == wrapperType_Standalone)
         setSourceKind(holotoner::SourceKind::Clicks);
-    startTimer(250);
+    startTimerHz(30);
 }
 
 HolotonerProcessor::~HolotonerProcessor()
@@ -119,14 +131,47 @@ juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::paramete
             .withLabel("%")
             .withStringFromValueFunction([](float value, int) { return juce::String(100.0f * value, 0); })
             .withValueFromStringFunction([](const juce::String& text) { return 0.01f * text.getFloatValue(); })));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        juce::ParameterID {"image_channel", 1}, "Image Channel",
+        juce::StringArray {"Off", "Luma", "Alpha", "Red", "Green", "Blue"}, 1));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        juce::ParameterID {"image_target", 1}, "Image Target",
+        juce::StringArray {"Off", "Place", "Level"}, 1));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"image_gain", 1}, "Image Gain",
+        juce::NormalisableRange<float> {0.0f, 8.0f, 0.01f, 0.5f}, 1.0f));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"image_fill", 1}, "Image Fill",
+        juce::NormalisableRange<float> {0.0f, 1.0f, 0.001f}, 0.0f,
+        juce::AudioParameterFloatAttributes()
+            .withLabel("%")
+            .withStringFromValueFunction([](float value, int) { return juce::String(100.0f * value, 0); })
+            .withValueFromStringFunction([](const juce::String& text) { return 0.01f * text.getFloatValue(); })));
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID {"image_normalize", 1}, "Normalize Image", true));
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID {"image_invert", 1}, "Invert Image", false));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        juce::ParameterID {"image_amount", 1}, "Image Amount",
+        juce::NormalisableRange<float> {0.0f, 1.0f, 0.001f}, 0.7f,
+        juce::AudioParameterFloatAttributes()
+            .withLabel("%")
+            .withStringFromValueFunction([](float value, int) { return juce::String(100.0f * value, 0); })
+            .withValueFromStringFunction([](const juce::String& text) { return 0.01f * text.getFloatValue(); })));
     return layout;
 }
 
 void HolotonerProcessor::prepareToPlay(double sampleRate, int)
 {
+    holotoner::ImageSpatializer::Parameters spatialParameters;
+    spatialParameters.plane = planeTransform();
+    spatialParameters.target = static_cast<holotoner::ImageTarget>(
+        juce::jlimit(0, 2, juce::roundToInt(imageTarget_->load(std::memory_order_relaxed))));
+    spatialParameters.imageAmount = imageAmount_->load(std::memory_order_relaxed);
+    spatialParameters.wet = wet_->load(std::memory_order_relaxed);
+    engine_.setParameters(spatialParameters);
     engine_.prepare(sampleRate);
-    engine_.setParameters({planeTransform(), wet_->load(std::memory_order_relaxed)});
-    engine_.reset();
+    setLatencySamples(engine_.latencySamples());
     sourcePlayer_.prepare(sampleRate);
     meterInputLeft_ = meterInputRight_ = meterOutputLeft_ = meterOutputRight_ = 0.0f;
     meterDecayPerSample_ = static_cast<float>(std::exp(-1.0 / (std::max(1.0, sampleRate) * 0.35)));
@@ -189,8 +234,16 @@ void HolotonerProcessor::processBlock(juce::AudioBuffer<float>& audio, juce::Mid
     inputLeft_.store(meterInputLeft_, std::memory_order_relaxed);
     inputRight_.store(meterInputRight_, std::memory_order_relaxed);
 
-    engine_.setParameters({planeTransform(), wet_->load(std::memory_order_relaxed)});
-    engine_.process(audio.getWritePointer(0), audio.getWritePointer(1), samples);
+    holotoner::ImageSpatializer::Parameters spatialParameters;
+    spatialParameters.plane = planeTransform();
+    spatialParameters.target = static_cast<holotoner::ImageTarget>(
+        juce::jlimit(0, 2, juce::roundToInt(imageTarget_->load(std::memory_order_relaxed))));
+    spatialParameters.imageAmount = imageAmount_->load(std::memory_order_relaxed);
+    spatialParameters.wet = wet_->load(std::memory_order_relaxed);
+    engine_.setParameters(spatialParameters);
+    const auto* mask = masks_.acquire();
+    masks_.hold(0, mask);
+    engine_.process(audio.getWritePointer(0), audio.getWritePointer(1), samples, mask);
     const auto outputMeter = measureBlock(audio.getReadPointer(0), audio.getReadPointer(1), samples);
     meterOutputLeft_ = std::max(outputMeter.left, meterOutputLeft_ * meterDecay);
     meterOutputRight_ = std::max(outputMeter.right, meterOutputRight_ * meterDecay);
@@ -261,7 +314,7 @@ void HolotonerProcessor::setStateInformation(const void* data, int sizeInBytes)
     }
     const auto state = juce::ValueTree::fromXml(*xml);
     const auto version = static_cast<int>(state.getProperty("format_version", 0));
-    if (version == kStateVersion) {
+    if (version >= kOldestReadableStateVersion && version <= kStateVersion) {
         parameters_.replaceState(state);
         const bool fileExists = sourceFileToRestore.existsAsFile();
         {
@@ -359,7 +412,12 @@ void HolotonerProcessor::setSourceMessage(const juce::String& message)
     sourceMessage_ = message;
 }
 
-void HolotonerProcessor::timerCallback() { sources_.collectGarbage(); }
+void HolotonerProcessor::timerCallback()
+{
+    sources_.collectGarbage();
+    masks_.collectGarbage();
+    rebuildImageMaskIfNeeded();
+}
 
 bool HolotonerProcessor::isSupportedImageFile(const juce::File& file)
 {
@@ -423,12 +481,10 @@ void HolotonerProcessor::loadImageData(juce::MemoryBlock data, juce::String name
             rgba.pixels[offset + 3] = colour.getAlpha();
         }
 
-    holotoner::ImageMaskSettings maskSettings;
-    maskSettings.channel = holotoner::PixelChannel::Luma;
     auto document = std::make_shared<ImageDocument>();
     document->image = decoded;
     document->name = std::move(name);
-    document->lumaMask = holotoner::buildImageMask(rgba, maskSettings);
+    document->rgba = std::move(rgba);
     juce::MemoryOutputStream encoded(document->normalizedPng, false);
     juce::PNGImageFormat png;
     if (!png.writeImageToStream(decoded, encoded)) {
@@ -443,6 +499,34 @@ void HolotonerProcessor::loadImageData(juce::MemoryBlock data, juce::String name
         image_ = std::move(document);
         imageMessage_.clear();
     }
+}
+
+void HolotonerProcessor::rebuildImageMaskIfNeeded()
+{
+    holotoner::ImageMaskSettings settings;
+    settings.channel = static_cast<holotoner::PixelChannel>(
+        juce::jlimit(0, 5, juce::roundToInt(imageChannel_->load(std::memory_order_relaxed))));
+    settings.gain = imageGain_->load(std::memory_order_relaxed);
+    settings.fill = imageFill_->load(std::memory_order_relaxed);
+    settings.normalize = imageNormalize_->load(std::memory_order_relaxed) >= 0.5f;
+    settings.invert = imageInvert_->load(std::memory_order_relaxed) >= 0.5f;
+    settings.amount = 1.0f;
+    const auto image = imageDocument();
+    const bool settingsChanged = !hasBuiltMaskSettings_
+        || settings.channel != builtMaskSettings_.channel
+        || std::abs(settings.gain - builtMaskSettings_.gain) > 1.0e-6f
+        || std::abs(settings.fill - builtMaskSettings_.fill) > 1.0e-6f
+        || settings.normalize != builtMaskSettings_.normalize
+        || settings.invert != builtMaskSettings_.invert;
+    if (image == maskImage_ && !settingsChanged)
+        return;
+    auto mask = std::make_shared<holotoner::ImageMask>();
+    if (image != nullptr)
+        *mask = holotoner::buildImageMask(image->rgba, settings);
+    masks_.publish(std::move(mask));
+    maskImage_ = image;
+    builtMaskSettings_ = settings;
+    hasBuiltMaskSettings_ = true;
 }
 
 std::shared_ptr<const HolotonerProcessor::ImageDocument> HolotonerProcessor::imageDocument() const

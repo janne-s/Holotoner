@@ -90,6 +90,7 @@ ImageMask buildImageMask(const RgbaImage& image, ImageMaskSettings settings)
     ImageMask result;
     if (!image.isValid() || settings.channel == PixelChannel::Off)
         return result;
+    result.hasSource = true;
 
     settings.gain = std::clamp(finiteOr(settings.gain, 1.0f), 0.0f, 8.0f);
     settings.fill = std::clamp(finiteOr(settings.fill, 0.0f), 0.0f, 1.0f);

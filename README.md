@@ -22,7 +22,7 @@ repository. Public documentation belongs here.
 
 ## Current development foundation
 
-The portable core currently establishes four invariants:
+The portable core currently establishes five invariants:
 
 1. one canonical three-axis plane projection for future native and web views;
 2. a smoothed signed mid/side baseline driven by that projection: a centred
@@ -32,12 +32,15 @@ The portable core currently establishes four invariants:
    immutable audio loaded away from the audio thread;
 4. deterministic RGBA-to-mask analysis for Off, luma, alpha and individual
    colour channels, including bounded gain, fill, normalize, invert and amount
-   behavior that preserves transparency.
+   behavior that preserves transparency;
+5. a fixed-latency image spatializer that maps the projected mask over
+   logarithmic frequency, can create stereo from mono, preserves the yaw 90
+   mono and yaw 180 reversal endpoints, and crossfades transform, target and
+   immutable mask changes without allocating in the render path.
 
-This is foundation work, not a released feature set. The final spectral
-mono-to-stereo path, selectable image modulation, the full polar analyser, the
-web application and release verification must be complete before the first
-release.
+This is a listening-capable development build, not a tagged release. The web
+application, broader analyser detail, licensed demo loop and full release
+verification remain before the first release.
 
 ## Build the core and tests
 
@@ -62,15 +65,39 @@ cmake --build build-native --parallel
 ```
 
 The current JUCE wrapper is an unreleased development build around the tested
-baseline. Its Standalone target starts with a test click and supports an
-off-thread file loader, host-transport-aware playback and common source
-controls. Its editor establishes the side-by-side interaction: an automatable
-plane panel controls the canonical transform, while a read-only polar panel
-shows the same projection, input/output level and output correlation. Image
-import accepts PNG, JPEG and GIF away from the audio thread, bounds and
-normalizes the image, embeds it in session state, and shows its luma projection
-in both panels. Spectral analysis and image-dependent audio processing are not
-yet implemented, so this is not a Holotoner release.
+image spatializer. Its Standalone target starts with test clicks and supports
+an off-thread audio-file loader, host-transport-aware playback and common
+source controls. Its editor uses the intended side-by-side interaction: an
+automatable image plane controls the canonical transform, while a read-only
+polar panel shows the same projection, selected mask, input/output level and
+output correlation.
+
+Image import accepts PNG, JPEG and GIF away from the audio thread, bounds and
+normalizes the image, embeds it in session state, and publishes a fixed 64 x 64
+mask through a lock-free handover. The image controls select Off, luma, alpha,
+red, green or blue; adjust gain and fill; optionally normalize or invert; and
+send a smoothed amount to Off, Place or Level. Place maps horizontal image
+energy to frequency-dependent stereo position and phase texture. Level maps
+vertical brightness to frequency-dependent gain. Geometry remains independent
+of pixel analysis in both cases.
+
+The spectral path uses a 2048-sample FFT with four-times overlap, covers 40 Hz
+to 16 kHz on a logarithmic image axis, and reports a fixed latency of 2047
+samples to the host. Dry is delayed to remain phase-aligned with Wet.
+
+## Development verification
+
+The deterministic core suite exercises 44.1, 48 and 96 kHz; whole and split
+blocks of 1, 31, 97 and 512 samples; geometry endpoints; delayed Dry; image
+mask bounds; mono-to-stereo placement; and a fully black Level mask. The
+Standalone, VST3 and AU targets are built as universal arm64/x86_64 binaries.
+The VST3 passes pluginval at strictness level 5, including editor, state,
+automation, bus-layout and 44.1/48/96 kHz processing checks.
+
+An arm64 Release measurement on 11 October 2026 rendered 60 seconds of the
+image spatializer at 48 kHz with 512-sample blocks in 0.45 seconds. That is
+0.75% of one real-time stream's wall-clock budget on the test machine; it is a
+development reference, not a cross-device performance guarantee.
 
 ## Licence
 

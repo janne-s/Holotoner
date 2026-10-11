@@ -32,6 +32,7 @@ struct ImageMaskSettings {
 /** Fixed-size immutable-by-convention data suitable for audio-thread handoff. */
 struct ImageMask {
     std::array<float, static_cast<std::size_t>(kImageMaskWidth * kImageMaskHeight)> values {};
+    bool hasSource = false;
 
     float at(int x, int y) const;
 };

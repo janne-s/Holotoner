@@ -47,9 +47,29 @@ private:
     juce::Label wetLabel_;
     juce::Slider wet_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> wetAttachment_;
+    juce::Label targetLabel_;
+    juce::ComboBox target_;
+    juce::Label channelLabel_;
+    juce::ComboBox channel_;
+    juce::Label gainLabel_;
+    juce::Slider gain_;
+    juce::Label fillLabel_;
+    juce::Slider fill_;
+    juce::Label amountLabel_;
+    juce::Slider amount_;
+    juce::ToggleButton normalize_ {"Normalize"};
+    juce::ToggleButton invert_ {"Invert"};
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> targetAttachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> channelAttachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainAttachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> fillAttachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> amountAttachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> normalizeAttachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> invertAttachment_;
     juce::Label status_;
     std::unique_ptr<juce::FileChooser> chooser_;
     std::shared_ptr<const HolotonerProcessor::ImageDocument> currentImage_;
+    std::shared_ptr<const holotoner::ImageMask> currentMask_;
     bool dragOver_ = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HolotonerEditor)

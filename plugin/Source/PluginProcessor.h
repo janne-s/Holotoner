@@ -2,7 +2,7 @@
 
 #include "core/audio/SharedExchange.h"
 #include "core/audio/SourcePlayer.h"
-#include "core/dsp/StereoWidth.h"
+#include "core/dsp/ImageSpatializer.h"
 #include "core/image/ImageMask.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -32,7 +32,7 @@ public:
         juce::Image image;
         juce::MemoryBlock normalizedPng;
         juce::String name;
-        holotoner::ImageMask lumaMask;
+        holotoner::RgbaImage rgba;
     };
 
     HolotonerProcessor();
@@ -50,7 +50,7 @@ public:
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    double getTailLengthSeconds() const override { return 0.1; }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -84,6 +84,7 @@ public:
 
     void loadImageFile(const juce::File& file);
     std::shared_ptr<const ImageDocument> imageDocument() const;
+    std::shared_ptr<const holotoner::ImageMask> imageMask() const { return masks_.currentShared(); }
     bool isLoadingImage() const { return imageLoadsPending_.load() > 0; }
     juce::String lastImageMessage() const;
     static bool isSupportedImageFile(const juce::File& file);
@@ -94,6 +95,7 @@ private:
     void setSourceMessage(const juce::String& message);
     void loadImageData(juce::MemoryBlock data, juce::String name, std::uint64_t request);
     void setImageMessage(const juce::String& message);
+    void rebuildImageMaskIfNeeded();
 
     juce::AudioProcessorValueTreeState parameters_;
     std::atomic<float>* positionX_ = nullptr;
@@ -104,7 +106,14 @@ private:
     std::atomic<float>* yaw_ = nullptr;
     std::atomic<float>* roll_ = nullptr;
     std::atomic<float>* wet_ = nullptr;
-    holotoner::StereoWidth engine_;
+    std::atomic<float>* imageChannel_ = nullptr;
+    std::atomic<float>* imageTarget_ = nullptr;
+    std::atomic<float>* imageGain_ = nullptr;
+    std::atomic<float>* imageFill_ = nullptr;
+    std::atomic<float>* imageNormalize_ = nullptr;
+    std::atomic<float>* imageInvert_ = nullptr;
+    std::atomic<float>* imageAmount_ = nullptr;
+    holotoner::ImageSpatializer engine_;
     std::atomic<float> inputLeft_ {0.0f};
     std::atomic<float> inputRight_ {0.0f};
     std::atomic<float> outputLeft_ {0.0f};
@@ -132,6 +141,10 @@ private:
     mutable std::mutex imageMutex_;
     std::shared_ptr<const ImageDocument> image_;
     juce::String imageMessage_;
+    holotoner::SharedExchange<holotoner::ImageMask> masks_;
+    std::shared_ptr<const ImageDocument> maskImage_;
+    holotoner::ImageMaskSettings builtMaskSettings_;
+    bool hasBuiltMaskSettings_ = false;
     /** Jobs refer to media members, so the destructor waits for them. */
     juce::ThreadPool mediaLoader_ {1};
 

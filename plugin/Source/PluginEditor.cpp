@@ -465,6 +465,53 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
     addAndMakeVisible(wetLabel_);
     addAndMakeVisible(wet_);
 
+    const auto configureLabel = [this](juce::Label& label, const juce::String& text) {
+        label.setText(text, juce::dontSendNotification);
+        label.setFont(juce::FontOptions(9.5f, juce::Font::bold));
+        label.setColour(juce::Label::textColourId, style::textDim);
+        label.setJustificationType(juce::Justification::centredLeft);
+        addAndMakeVisible(label);
+    };
+    const auto configureSlider = [this](juce::Slider& slider, bool percentage) {
+        slider.setSliderStyle(juce::Slider::LinearHorizontal);
+        slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 48, 24);
+        if (percentage) {
+            slider.textFromValueFunction = [](double value) { return juce::String(100.0 * value, 0) + " %"; };
+            slider.valueFromTextFunction = [](const juce::String& text) { return 0.01 * text.getDoubleValue(); };
+        }
+        addAndMakeVisible(slider);
+    };
+    configureLabel(targetLabel_, "TARGET");
+    configureLabel(channelLabel_, "CHANNEL");
+    configureLabel(gainLabel_, "GAIN");
+    configureLabel(fillLabel_, "FILL");
+    configureLabel(amountLabel_, "AMOUNT");
+    target_.addItemList({"Off", "Place", "Level"}, 1);
+    channel_.addItemList({"Off", "Luma", "Alpha", "Red", "Green", "Blue"}, 1);
+    addAndMakeVisible(target_);
+    addAndMakeVisible(channel_);
+    configureSlider(gain_, false);
+    configureSlider(fill_, true);
+    configureSlider(amount_, true);
+    normalize_.setColour(juce::ToggleButton::textColourId, style::text);
+    invert_.setColour(juce::ToggleButton::textColourId, style::text);
+    addAndMakeVisible(normalize_);
+    addAndMakeVisible(invert_);
+    targetAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor_.state(), "image_target", target_);
+    channelAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
+        processor_.state(), "image_channel", channel_);
+    gainAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor_.state(), "image_gain", gain_);
+    fillAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor_.state(), "image_fill", fill_);
+    amountAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+        processor_.state(), "image_amount", amount_);
+    normalizeAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor_.state(), "image_normalize", normalize_);
+    invertAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+        processor_.state(), "image_invert", invert_);
+
     status_.setFont(juce::FontOptions(10.5f));
     status_.setColour(juce::Label::textColourId, style::textDim);
     addAndMakeVisible(status_);
@@ -515,6 +562,21 @@ void HolotonerEditor::resized()
     area.removeFromTop(8);
     status_.setBounds(area.removeFromBottom(24));
     area.removeFromBottom(4);
+    auto controls = area.removeFromBottom(48);
+    const auto placeControl = [&controls](juce::Label& label, juce::Component& control, int width) {
+        auto slot = controls.removeFromLeft(width);
+        label.setBounds(slot.removeFromTop(15));
+        control.setBounds(slot.removeFromTop(28));
+        controls.removeFromLeft(6);
+    };
+    placeControl(targetLabel_, target_, 74);
+    placeControl(channelLabel_, channel_, 84);
+    placeControl(gainLabel_, gain_, 116);
+    placeControl(fillLabel_, fill_, 116);
+    placeControl(amountLabel_, amount_, 128);
+    normalize_.setBounds(controls.removeFromLeft(92).withTrimmedTop(14));
+    invert_.setBounds(controls.removeFromLeft(72).withTrimmedTop(14));
+    area.removeFromBottom(8);
     const auto gap = 8;
     const auto leftWidth = (area.getWidth() - gap) / 2;
     planeView_->setBounds(area.removeFromLeft(leftWidth));
@@ -621,10 +683,15 @@ void HolotonerEditor::refresh()
                          juce::dontSendNotification);
 
     const auto image = processor_.imageDocument();
+    const bool imageChanged = image != currentImage_;
     if (image != currentImage_) {
         currentImage_ = image;
         planeView_->setImage(image != nullptr ? image->image : juce::Image {});
-        polarView_->setMask(image != nullptr ? &image->lumaMask : nullptr);
+    }
+    const auto mask = processor_.imageMask();
+    if (mask != currentMask_ || imageChanged) {
+        currentMask_ = mask;
+        polarView_->setMask(image != nullptr && mask != nullptr ? mask.get() : nullptr);
     }
 
     juce::String message;

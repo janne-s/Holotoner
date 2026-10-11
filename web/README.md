@@ -2,8 +2,11 @@
 
 This directory will contain the production browser wrapper around
 `holotoner_core`. It is intentionally documentation-only until the shared
-image-driven DSP contract is ready; there is no separate JavaScript audio
-implementation to drift away from the native product.
+image-driven DSP contract has been validated through native listening; there
+will be no separate JavaScript audio implementation to drift away from the
+native product. The shared core already contains the deterministic image mask,
+plane projection and fixed-latency spatializer intended for the WebAssembly
+build.
 
 The accepted boundary is:
 

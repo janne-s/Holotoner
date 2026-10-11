@@ -1,5 +1,6 @@
 #include "core/audio/SharedExchange.h"
 #include "core/audio/SourcePlayer.h"
+#include "core/dsp/ImageSpatializer.h"
 #include "core/dsp/StereoWidth.h"
 #include "core/geometry/PlaneProjection.h"
 #include "core/image/ImageMask.h"
@@ -249,6 +250,10 @@ void imageMaskIsDeterministic()
     holotoner::ImageMaskSettings settings;
     settings.channel = holotoner::PixelChannel::Luma;
     const auto empty = holotoner::buildImageMask({}, settings);
+    if (empty.hasSource) {
+        std::cerr << "invalid image mask reports a source\n";
+        ++failures;
+    }
     for (const auto value : empty.values)
         expectNear(value, 0.0f, 0.0f, "invalid image produces an empty mask");
 
@@ -262,6 +267,10 @@ void imageMaskIsDeterministic()
 
     settings.channel = holotoner::PixelChannel::Red;
     auto mask = holotoner::buildImageMask(image, settings);
+    if (!mask.hasSource) {
+        std::cerr << "valid image mask lost its source marker\n";
+        ++failures;
+    }
     expectNear(mask.at(0, 0), 1.0f, 1.0e-6f, "red mask reads red");
     expectNear(mask.at(63, 0), 0.0f, 1.0e-6f, "red mask rejects green");
     expectNear(mask.at(63, 63), 0.0f, 1.0e-6f, "transparent pixel stays empty");
@@ -286,6 +295,162 @@ void imageMaskIsDeterministic()
         }
 }
 
+void imageSpatializerIsBlockIndependent()
+{
+    constexpr std::size_t count = 8192;
+    std::array<float, count> wholeLeft {};
+    std::array<float, count> wholeRight {};
+    for (std::size_t i = 0; i < count; ++i) {
+        wholeLeft[i] = static_cast<float>(0.3 * std::sin(static_cast<double>(i) * 0.071));
+        wholeRight[i] = static_cast<float>(0.2 * std::cos(static_cast<double>(i) * 0.053));
+    }
+    auto splitLeft = wholeLeft;
+    auto splitRight = wholeRight;
+
+    holotoner::ImageMask mask;
+    mask.hasSource = true;
+    for (int y = 0; y < holotoner::kImageMaskHeight; ++y)
+        for (int x = 0; x < holotoner::kImageMaskWidth; ++x)
+            mask.values[static_cast<std::size_t>(y * holotoner::kImageMaskWidth + x)]
+                = x > y / 2 ? 0.75f : 0.1f;
+
+    holotoner::ImageSpatializer::Parameters parameters;
+    parameters.plane.positionX = 0.2f;
+    parameters.plane.yawDegrees = 32.0f;
+    parameters.imageAmount = 0.85f;
+    parameters.wet = 0.9f;
+    holotoner::ImageSpatializer whole;
+    holotoner::ImageSpatializer split;
+    whole.setParameters(parameters);
+    split.setParameters(parameters);
+    whole.prepare(48000.0);
+    split.prepare(48000.0);
+    whole.process(wholeLeft.data(), wholeRight.data(), static_cast<int>(count), &mask);
+
+    constexpr std::array<int, 4> blocks {1, 31, 97, 512};
+    std::size_t at = 0;
+    std::size_t block = 0;
+    while (at < count) {
+        const auto samples = std::min(count - at, static_cast<std::size_t>(blocks[block % blocks.size()]));
+        split.process(splitLeft.data() + at, splitRight.data() + at, static_cast<int>(samples), &mask);
+        at += samples;
+        ++block;
+    }
+
+    for (std::size_t i = 0; i < count; ++i) {
+        expectNear(splitLeft[i], wholeLeft[i], 0.0f, "image spatializer block-independent left");
+        expectNear(splitRight[i], wholeRight[i], 0.0f, "image spatializer block-independent right");
+    }
+}
+
+void imageSpatializerEndpoints(double sampleRate)
+{
+    constexpr std::size_t count = 12288;
+    constexpr auto latency = holotoner::ImageSpatializer::kFftSize - 1;
+    std::array<float, count> inputLeft {};
+    std::array<float, count> inputRight {};
+    for (std::size_t i = 0; i < count; ++i) {
+        inputLeft[i] = static_cast<float>(0.2 * std::sin(static_cast<double>(i) * 0.12));
+        inputRight[i] = static_cast<float>(0.15 * std::cos(static_cast<double>(i) * 0.077));
+    }
+
+    holotoner::ImageSpatializer::Parameters parameters;
+    parameters.wet = 0.0f;
+    holotoner::ImageSpatializer dry;
+    dry.setParameters(parameters);
+    dry.prepare(sampleRate);
+    auto dryLeft = inputLeft;
+    auto dryRight = inputRight;
+    dry.process(dryLeft.data(), dryRight.data(), static_cast<int>(count), nullptr);
+    for (std::size_t i = latency; i < count; ++i) {
+        expectNear(dryLeft[i], inputLeft[i - latency], 0.0f, "spatializer dry delay left");
+        expectNear(dryRight[i], inputRight[i - latency], 0.0f, "spatializer dry delay right");
+    }
+
+    parameters.wet = 1.0f;
+    parameters.plane.yawDegrees = 90.0f;
+    holotoner::ImageSpatializer edge;
+    edge.setParameters(parameters);
+    edge.prepare(sampleRate);
+    auto edgeLeft = inputLeft;
+    auto edgeRight = inputRight;
+    edge.process(edgeLeft.data(), edgeRight.data(), static_cast<int>(count), nullptr);
+    for (std::size_t i = 2 * holotoner::ImageSpatializer::kFftSize; i < count; ++i)
+        expectNear(edgeLeft[i], edgeRight[i], 2.0e-5f, "edge-on plane is mono");
+
+    parameters.plane.yawDegrees = 180.0f;
+    holotoner::ImageSpatializer back;
+    back.setParameters(parameters);
+    back.prepare(sampleRate);
+    auto backLeft = inputLeft;
+    auto backRight = inputRight;
+    back.process(backLeft.data(), backRight.data(), static_cast<int>(count), nullptr);
+    for (std::size_t i = 2 * holotoner::ImageSpatializer::kFftSize; i < count; ++i) {
+        expectNear(backLeft[i], inputRight[i - latency], 2.0e-5f, "back plane swaps left");
+        expectNear(backRight[i], inputLeft[i - latency], 2.0e-5f, "back plane swaps right");
+    }
+}
+
+void imageSpatializerMakesMonoImageStereo()
+{
+    constexpr std::size_t count = 12288;
+    std::array<float, count> left {};
+    std::array<float, count> right {};
+    for (std::size_t i = 0; i < count; ++i)
+        left[i] = right[i] = static_cast<float>(0.2 * std::sin(static_cast<double>(i) * 0.21));
+
+    holotoner::ImageMask mask;
+    mask.hasSource = true;
+    for (int y = 0; y < holotoner::kImageMaskHeight; ++y)
+        for (int x = 0; x < holotoner::kImageMaskWidth; ++x)
+            mask.values[static_cast<std::size_t>(y * holotoner::kImageMaskWidth + x)]
+                = x >= 40 ? 1.0f : 0.0f;
+
+    holotoner::ImageSpatializer::Parameters parameters;
+    parameters.target = holotoner::ImageTarget::Place;
+    parameters.imageAmount = 1.0f;
+    parameters.wet = 1.0f;
+    holotoner::ImageSpatializer engine;
+    engine.setParameters(parameters);
+    engine.prepare(48000.0);
+    engine.process(left.data(), right.data(), static_cast<int>(count), &mask);
+    double differenceEnergy = 0.0;
+    for (std::size_t i = 2 * holotoner::ImageSpatializer::kFftSize; i < count; ++i) {
+        const auto difference = static_cast<double>(left[i] - right[i]);
+        differenceEnergy += difference * difference;
+    }
+    if (differenceEnergy < 1.0e-4) {
+        std::cerr << "image placement did not make mono input stereo\n";
+        ++failures;
+    }
+}
+
+void blackImageCanSilenceLevelTarget()
+{
+    constexpr std::size_t count = 12288;
+    std::array<float, count> left {};
+    std::array<float, count> right {};
+    for (std::size_t i = 0; i < count; ++i)
+        left[i] = right[i] = static_cast<float>(0.2 * std::sin(static_cast<double>(i) * 0.11));
+    holotoner::ImageMask black;
+    black.hasSource = true;
+    holotoner::ImageSpatializer::Parameters parameters;
+    parameters.target = holotoner::ImageTarget::Level;
+    parameters.imageAmount = 1.0f;
+    parameters.wet = 1.0f;
+    holotoner::ImageSpatializer engine;
+    engine.setParameters(parameters);
+    engine.prepare(48000.0);
+    engine.process(left.data(), right.data(), static_cast<int>(count), &black);
+    float endingPeak = 0.0f;
+    for (std::size_t i = count - holotoner::ImageSpatializer::kHopSize; i < count; ++i)
+        endingPeak = std::max({endingPeak, std::abs(left[i]), std::abs(right[i])});
+    if (endingPeak > 1.0e-4f) {
+        std::cerr << "black image level fade did not converge, peak " << endingPeak << '\n';
+        ++failures;
+    }
+}
+
 } // namespace
 
 int main()
@@ -300,6 +465,12 @@ int main()
     sourcePlayerIsDeterministic();
     sharedExchangeRetiresOffAudioPath();
     imageMaskIsDeterministic();
+    imageSpatializerIsBlockIndependent();
+    imageSpatializerEndpoints(44100.0);
+    imageSpatializerEndpoints(48000.0);
+    imageSpatializerEndpoints(96000.0);
+    imageSpatializerMakesMonoImageStereo();
+    blackImageCanSilenceLevelTarget();
     if (failures != 0)
         std::cerr << failures << " test assertion(s) failed\n";
     return failures == 0 ? 0 : 1;
