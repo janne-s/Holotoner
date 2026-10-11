@@ -66,6 +66,15 @@ void ImageSpatializer::reset()
     safetyResets_ = 0;
     phaseControls_.fill({});
     phaseInitialized_ = false;
+    fieldTime_ = 0.0;
+    steeringBlend_ = 1.0f;
+    for (int row = 0; row < ImageMask::kFieldRows; ++row)
+        for (int column = 0; column < ImageMask::kFieldAngles; ++column) {
+            const auto at = static_cast<std::size_t>(row*ImageMask::kFieldAngles+column);
+            steering_[at] = -0.5f*std::numbers::pi_v<float> + std::numbers::pi_v<float>
+                *static_cast<float>(column)/static_cast<float>(ImageMask::kFieldAngles-1);
+        }
+    previousSteering_ = steering_;
 
 }
 
@@ -121,6 +130,7 @@ void ImageSpatializer::process(float* left, float* right, int sampleCount, const
         auto wetRight = outputRight_[read];
         outputLeft_[read] = 0.0;
         outputRight_[read] = 0.0;
+        constrainField(wetLeft, wetRight);
         wetCurrent_ += (parameters_.wet - wetCurrent_) * wetRate_;
         const auto outLeft = static_cast<double>(delayedLeft) + static_cast<double>(wetCurrent_)
             * (wetLeft - static_cast<double>(delayedLeft));
@@ -139,6 +149,7 @@ void ImageSpatializer::process(float* left, float* right, int sampleCount, const
 
 void ImageSpatializer::renderFrame(const ImageMask* mask)
 {
+    fieldTime_ += static_cast<double>(kHopSize) / sampleRate_;
     smoothFrameState(mask);
     const auto projection = projectPlane(smoothedParameters_.plane);
     auto phaseTransform = smoothedParameters_.plane;
@@ -256,11 +267,54 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     smooth(smoothedParameters_.imageAmount, parameters_.imageAmount);
     for (std::size_t i = 0; i < smoothedMask_.values.size(); ++i)
         smooth(smoothedMask_.values[i], targetMask_.values[i]);
+    previousSteering_ = steering_;
+    steeringBlend_ = 0.0f;
+    if (targetMask_.fieldReady)
+        for (std::size_t i = 0; i < steering_.size(); ++i)
+            smooth(steering_[i], targetMask_.fieldAngles[i]);
     smooth(maskPresence_, targetMaskPresence_);
     smoothedMask_.hasSource = maskPresence_ > 1.0e-6;
     const auto selectedTarget = static_cast<std::size_t>(parameters_.target);
     for (std::size_t i = 0; i < targetWeights_.size(); ++i)
         smooth(targetWeights_[i], i == selectedTarget ? 1.0 : 0.0);
+}
+
+void ImageSpatializer::constrainField(double& left, double& right)
+{
+    const auto mid = 0.5*(left+right), side = 0.5*(right-left);
+    const auto level = std::hypot(mid, side);
+    const auto amount = targetWeights_[3]*maskPresence_*smoothedParameters_.imageAmount;
+    steeringBlend_ = std::min(1.0f, steeringBlend_ + 1.0f/static_cast<float>(kHopSize));
+    if (level < 1.0e-9 || amount < 1.0e-6 || !targetMask_.fieldReady)
+        return;
+    const auto polarity = mid >= 0.0 ? 1.0 : -1.0;
+    const auto angle = std::atan2(polarity*side, std::abs(mid));
+    // Same calibrated level axis as the measured +14 dB scope. No audio gain is applied.
+    const auto radius = std::clamp(1.0 + std::log10(std::max(level*5.0, 1.0e-6))/3.0, 0.0, 1.0);
+    const auto rowPosition = std::clamp(radius*ImageMask::kFieldRows-0.5, 0.0,
+                                      static_cast<double>(ImageMask::kFieldRows-1));
+    const auto columnPosition = std::clamp((angle/std::numbers::pi+0.5)
+        *static_cast<double>(ImageMask::kFieldAngles-1), 0.0, static_cast<double>(ImageMask::kFieldAngles-1));
+    const auto row = static_cast<int>(rowPosition), column = static_cast<int>(columnPosition);
+    const auto nextRow = std::min(row+1, ImageMask::kFieldRows-1);
+    const auto nextColumn = std::min(column+1, ImageMask::kFieldAngles-1);
+    const auto readAngle = [this](int r, int c) {
+        const auto at = static_cast<std::size_t>(r*ImageMask::kFieldAngles+c);
+        return static_cast<double>(previousSteering_[at] + steeringBlend_*(steering_[at]-previousSteering_[at]));
+    };
+    const auto tx = columnPosition-column, ty = rowPosition-row;
+    const auto top = readAngle(row,column)*(1-tx)+readAngle(row,nextColumn)*tx;
+    const auto bottom = readAngle(nextRow,column)*(1-tx)+readAngle(nextRow,nextColumn)*tx;
+    // Avoid a waveform discontinuity at Polar Sample's polarity-fold seam.
+    const auto seam = std::min(1.0, std::abs(mid)/(0.05*level));
+    const auto rotation = amount*seam*(top*(1-ty)+bottom*ty-angle);
+    const auto c = std::cos(rotation), s = std::sin(rotation);
+    // Rotate the EXISTING sample vector: L²+R² is unchanged at every sample.
+    // No pixel-derived amplitude, envelope, sign-only carrier or silent-row gating.
+    const auto rotatedMid = c*mid-s*side;
+    const auto rotatedSide = s*mid+c*side;
+    left = rotatedMid-rotatedSide;
+    right = rotatedMid+rotatedSide;
 }
 
 void ImageSpatializer::buildPhaseControls(const ProjectedPlane& projection)
@@ -278,6 +332,10 @@ void ImageSpatializer::buildPhaseControls(const ProjectedPlane& projection)
                                       -1.25, 1.25);
             target.relative = std::numbers::pi * 0.75 * std::clamp(1.0 - radius, 0.0, 1.0);
             target.common = std::numbers::pi * 0.6 * (radius - 0.5);
+            // Spectral Space's per-bin phase drift, bounded and independent of pitch/level.
+            const auto offset = static_cast<double>(i) * 2.399963229728653;
+            target.relative += 0.3 * std::sin(2.0*std::numbers::pi*0.17*fieldTime_ + offset);
+            target.common += 0.15 * std::sin(2.0*std::numbers::pi*0.11*fieldTime_ + offset);
         }
         auto& current = phaseControls_[i];
         current.angle += smooth * (target.angle - current.angle);

@@ -18,7 +18,7 @@ enum class ImageTarget { Off, Place, Level, Phase };
 /**
  * Fixed-latency image spatializer.
  *
- * Phase applies a static image-derived unitary mid/side spectral transform.
+ * Phase combines bounded spectral phase drift with a projected image steering field.
  * Place/Level use a 2048-sample, four-times-overlapped spectral alternative.
  * Both paths and Dry have the same fixed latency. No allocation after prepare.
  */
@@ -28,6 +28,8 @@ public:
     static constexpr std::size_t kHopSize = kFftSize / 4;
     static constexpr std::size_t kAnalysisBins = 64;
 
+    /** Spectral-stage diagnostics, BEFORE sample-domain image steering.
+        The actual output vectorscope must consume processed L/R samples. */
     struct Analysis {
         std::array<float, kAnalysisBins> level {};
         std::array<float, kAnalysisBins> balance {};
@@ -95,6 +97,10 @@ private:
     static constexpr std::size_t kPhaseAnchors = 33;
     std::array<PhaseControls, kPhaseAnchors> phaseControls_ {};
     bool phaseInitialized_ = false;
+    double fieldTime_ = 0.0;
+    std::array<float, ImageMask::kFieldRows * ImageMask::kFieldAngles> steering_ {}, previousSteering_ {};
+    float steeringBlend_ = 1.0f;
+    void constrainField(double& left, double& right);
     void buildPhaseControls(const ProjectedPlane&);
     void applyPhase(std::size_t bin, std::complex<double> left, std::complex<double> right,
                     double signedWidth, std::complex<double>& outLeft, std::complex<double>& outRight) const;

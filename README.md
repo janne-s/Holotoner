@@ -39,23 +39,30 @@ Original image aspect is preserved until you scale the two axes independently.
 
 ## What the image does to audio
 
-Phase map compiles a brightness-weighted distribution of the full 2D mask
-off-thread. Fixed image samples define 33 smoothly interpolated phase/stereo
-anchors across 0–16 kHz. Projection controls stereo direction; radius controls
-relative/common phase, NOT audio level. Each frequency uses a unitary mid/side
-rotation after the geometric width baseline. There is no moving image scan,
-polarity-based replacement waveform, amplitude envelope or free-running sound.
+Phase map now has two cooperating stages. The spectral stage spreads the
+original audio with image-derived stereo/phase relationships and bounded,
+slow phase drift (0.11/0.17 Hz, independent of pitch and source level), following
+Spectral Space's phase-diffusion principle. It does not synthesize a carrier.
 
-The source spectrum and dynamics remain the audio material. At rest the image
-defines a static spectral phase field; changing image, geometry or projection
-smooths the coefficients over 20 ms. Geometric narrowing can remove side energy,
-and partial Dry/Wet can cause phase cancellation; those are not tremolo.
+The image stage projects the full mask into a 64-radius × 129-direction
+steering field OFF the audio thread. At the actual sample level, it finds image
+support and rotates the existing mid/side sample pair towards it. This retains
+L²+R² at every sample: pixels cannot force audio level, gate empty rows or
+replace the waveform with its sign/envelope. Empty radial rows leave the
+direction alone. A narrow seam fade avoids a jump where Polar Sample folds
+negative polarity. Field/geometry changes are smoothed over 20 ms.
 
-The faint projected image is a spatial target, not a promise of pixel-perfect
-audio reproduction. A single sine produces a line/ellipse; broadband material
-reveals more of the image-derived field. The output shape can be less literal
-than the former waveform scanner. No fake image points are added to the measured
-output to compensate for this. Listening judgment remains necessary.
+This second stage is nonlinear spatial steering, not a transparent all-pass
+filter: it can colour the waveform and introduce harmonics. Retained combined
+stereo energy does NOT imply unchanged individual channels, unchanged mono,
+or a guarantee of no audible pumping. Subjective listening still matters.
+Amount reduces both steering and phase-field influence; Wet blends aligned Dry.
+
+The image now constrains real output points, not just 33 frequency settings.
+Broadband material reveals more of the shape; source level determines which
+radii are available. The field never invents level to fill missing portions of
+the picture. Some spill remains around the polarity seam, outside image radial
+support, and during transitions. No fake points are added to measured output.
 
 The analyser folds negative sample polarity into the upper semicircle.
 Direction follows the L/R relationship; radius follows sample level on a
@@ -72,9 +79,9 @@ All paths, including Dry, use the same 2047-sample latency.
 
 Image import accepts PNG, JPEG and GIF off-thread. Images are normalized and
 embedded in versioned session state, so the original file is not required to
-reopen a session. State version 5 replaces the unreleased waveform scanner with
-the spatial phase field. Versions 2–4 remain readable with their images and
-controls; old Phase map sessions use the corrected DSP, not the rejected scanner.
+reopen a session. State version 6 adds the projected image steering field.
+Versions 2–5 remain readable with their images and controls; old Phase map
+sessions use the corrected DSP, not the rejected scanner or fixed-only field.
 Media stays local.
 
 ## Repository and verification
@@ -97,12 +104,14 @@ ctest --test-dir build/core-release --output-on-failure
 
 The core tests cover 44.1/48/96 kHz, blocks 1/31/97/512, exact delayed Dry,
 geometry endpoints, mono-to-stereo, silence, deterministic masks and image
-changes. Phase-map tests verify source linearity, stereo power, and pure-tone
-purity/stability at 110/440/1760/7040 Hz across all three sample rates. Residual
-energy outside the original tone must be below −50 dB and fitted stereo power
-modulation below 0.5%; power must stay within 2% at the centred mono-input test.
-These replace the old scanner's pixel-occupancy criterion: spatial sound takes
-priority over exact waveform drawing.
+changes. Image-off tests verify source linearity and pure-tone purity at
+110/440/1760/7040 Hz. They do NOT claim that nonlinear image steering is
+harmonic-free. The image-on test measures actual L/R samples from a 16-partial
+source: at least 90% of points in the tested radial range must hit the image
+within two mask pixels, with both main parts of the asymmetric figure visited.
+Measured hits were about 98%, versus 22% without image steering. Steering must
+retain instantaneous stereo power within 1e-7 of the same phase field without
+steering (measured error below 5e-9).
 
 Run the GUI/native harness in a desktop session; it does not open an audio device:
 
@@ -111,14 +120,15 @@ cmake --build build/native-release --target holotoner-native-tests --parallel
 build/native-release/tests/holotoner-native-tests
 ```
 
-It checks embedded-image/parameter round-trips, file-source playback, actual
+It checks embedded-image/parameter/field round-trips, geometry-only field
+rebuilds, file-source playback, actual
 sample history, and renders a diagnostic editor image to
 `/tmp/holotoner-phase-editor.png`. Its media fixtures are original, temporary
 test data, not a bundled demo.
 
 Standalone, VST3 and AU build as universal arm64/x86_64 binaries. VST3 passes
 pluginval strictness 5. The native harness measured 60 seconds of Phase map,
-including sample history, in 0.58 seconds on 11 October 2026 (about 0.97% of
+including sample history, in 0.68 seconds on 11 October 2026 (about 1.14% of
 one real-time stream's wall-clock budget). Timings are machine-specific, not
 a cross-device performance guarantee.
 

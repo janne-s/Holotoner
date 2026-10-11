@@ -349,7 +349,7 @@ public:
         const auto projection = processor_.state().getRawParameterValue("image_projection")->load() >= 0.5f
             ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
         if (hasMask_ && isPhase) {
-            auto transform = processor_.planeTransform();
+            auto transform = mask_.fieldReady ? mask_.fieldPlane : processor_.planeTransform();
             transform.scaleX *= mask_.aspectX;
             transform.scaleY *= mask_.aspectY;
             const auto plane = holotoner::projectPlane(transform);
@@ -724,7 +724,7 @@ void HolotonerEditor::refresh()
     if (image != nullptr)
         message += "    Image: " + image->name;
     if (target_.getSelectedId() == 4)
-        message += "    Image phase field; source spectrum drives the measured shape.";
+        message += "    Image-constrained phase field; stereo energy is retained.";
     else
         message += "    Polar measures audio; image gestures are automatable.";
     status_.setText(message, juce::dontSendNotification);

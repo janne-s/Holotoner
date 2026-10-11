@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <vector>
+#include "core/dsp/PhaseMap.h"
 
 namespace holotoner {
 
@@ -29,6 +30,8 @@ struct ImageMaskSettings {
     float amount = 1.0f;
     float threshold = 0.0f;
     bool binary = false;
+    PlaneTransform plane;
+    PhaseProjection projection = PhaseProjection::Cartesian;
 };
 
 /** Fixed-size immutable-by-convention data suitable for audio-thread handoff. */
@@ -41,6 +44,13 @@ struct ImageMask {
     bool hasPhasePoints = false;
     float aspectX = 1.0f, aspectY = 1.0f;
     bool hasSource = false;
+    static constexpr int kFieldRows = 64;
+    static constexpr int kFieldAngles = 129;
+    // Conditional image support at each actual sample radius. Empty rows are identity.
+    std::array<float, kFieldRows * kFieldAngles> fieldAngles {};
+    PlaneTransform fieldPlane;
+    PhaseProjection fieldProjection = PhaseProjection::Cartesian;
+    bool fieldReady = false;
 
     float at(int x, int y) const;
 };
@@ -50,5 +60,7 @@ struct ImageMask {
  * Transparent pixels stay empty; Fill only raises values inside alpha.
  */
 ImageMask buildImageMask(const RgbaImage& image, ImageMaskSettings settings);
+/** Off-thread rasterization: never call from the render callback. */
+void buildImageField(ImageMask& mask, PlaneTransform plane, PhaseProjection projection);
 
 } // namespace holotoner

@@ -522,8 +522,8 @@ void phaseMapCoordinatesAreActualAudio()
 
 void phaseImageProcessing(double sampleRate)
 {
-    const auto mask = phaseFixture(false);
-    const auto other = phaseFixture(true);
+    auto mask = phaseFixture(false);
+    auto other = phaseFixture(true);
     if (!mask.hasPhasePoints || !other.hasPhasePoints) {
         std::cerr << "phase map distribution missing\n";
         ++failures;
@@ -540,6 +540,8 @@ void phaseImageProcessing(double sampleRate)
     parameters.target = holotoner::ImageTarget::Phase;
     parameters.imageAmount = 1.0f;
     parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
+    holotoner::buildImageField(mask, parameters.plane, parameters.phaseProjection);
+    holotoner::buildImageField(other, parameters.plane, parameters.phaseProjection);
     for (auto* engine : {&whole, &split, &mirrored}) {
         engine->setParameters(parameters);
         engine->prepare(sampleRate);
@@ -574,6 +576,7 @@ void phaseImageProcessing(double sampleRate)
         ++failures;
     }
     parameters.plane.yawDegrees = 180.0f;
+    holotoner::buildImageField(mask, parameters.plane, parameters.phaseProjection);
     mirrored.setParameters(parameters);
     mirrored.prepare(sampleRate);
     otherL = otherR = input;
@@ -583,19 +586,21 @@ void phaseImageProcessing(double sampleRate)
         expectNear(otherR[i], wholeL[i], 2.0e-5f, "phase backside swaps right");
     }
     parameters.plane.yawDegrees = 90.0f;
+    auto edgeMask = mask;
+    holotoner::buildImageField(edgeMask, parameters.plane, parameters.phaseProjection);
     whole.setParameters(parameters);
     wholeL = wholeR = input;
-    whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &mask);
+    whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &edgeMask);
     for (std::size_t i = count - 512; i < count; ++i)
         expectNear(wholeL[i], wholeR[i], 2.0e-5f, "phase edge-on is mono");
     std::fill(wholeL.begin(), wholeL.end(), 0.0f);
     std::fill(wholeR.begin(), wholeR.end(), 0.0f);
-    whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &mask);
+    whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &edgeMask);
     for (std::size_t i = count - 512; i < count; ++i)
         expectNear(wholeL[i], 0.0f, 1.0e-5f, "phase silence does not self-generate");
 }
 
-void phasePreservesTone(double sampleRate, double hz, bool stereo = false)
+void imageOffPreservesTone(double sampleRate, double hz, bool stereo = false)
 {
     const auto mask = phaseFixture(false);
     constexpr std::size_t count = 65536;
@@ -609,6 +614,7 @@ void phasePreservesTone(double sampleRate, double hz, bool stereo = false)
     holotoner::ImageSpatializer engine;
     holotoner::ImageSpatializer::Parameters parameters;
     parameters.plane.scaleX = parameters.plane.scaleY = 1.0f;
+    parameters.imageAmount = 0.0f; // Image-off reference: original source must remain intact.
     engine.setParameters(parameters);
     engine.prepare(sampleRate);
     engine.process(left.data(), right.data(), static_cast<int>(count), &mask);
@@ -632,7 +638,7 @@ void phasePreservesTone(double sampleRate, double hz, bool stereo = false)
         minimum = std::min(minimum, power);
         maximum = std::max(maximum, power);
     }
-    std::cout << "Phase tone " << sampleRate << "/" << hz << ": residual "
+    std::cout << "Image-off tone " << sampleRate << "/" << hz << ": residual "
               << residual/total << ", power modulation " << (maximum-minimum)/maximum << '\n';
     if (residual / std::max(total, 1.0e-20) > 0.00001
         || (maximum - minimum) / std::max(maximum, 1.0e-20) > 0.005) {
@@ -658,6 +664,67 @@ void phasePreservesTone(double sampleRate, double hz, bool stereo = false)
     for (std::size_t i = 32768; i < count; ++i) {
         expectNear(halfL[i], 0.5f * left[i], 1.0e-6f, "phase source linearity left");
         expectNear(halfR[i], 0.5f * right[i], 1.0e-6f, "phase source linearity right");
+    }
+}
+
+void imageFieldMeasuredSupport(double sampleRate)
+{
+    auto mask = phaseFixture(false);
+    holotoner::ImageSpatializer::Parameters parameters;
+    parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
+    holotoner::buildImageField(mask, parameters.plane, parameters.phaseProjection);
+    auto referenceMask = mask;
+    for (int row = 0; row < holotoner::ImageMask::kFieldRows; ++row)
+        for (int column = 0; column < holotoner::ImageMask::kFieldAngles; ++column)
+            referenceMask.fieldAngles[static_cast<std::size_t>(row*holotoner::ImageMask::kFieldAngles+column)]
+                = static_cast<float>(-0.5*3.141592653589793 + 3.141592653589793
+                    *column/(holotoner::ImageMask::kFieldAngles-1));
+    constexpr std::size_t count = 131072;
+    std::vector<float> left(count), right(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        double value = 0.0;
+        for (int partial = 1; partial <= 16; ++partial)
+            value += 0.009*std::sin(2.0*3.141592653589793*(97.0*partial+7.0*partial*partial)
+                *static_cast<double>(i)/sampleRate + partial*2.399963229728653);
+        left[i] = right[i] = static_cast<float>(value);
+    }
+    auto refL = left, refR = right;
+    holotoner::ImageSpatializer engine, reference;
+    engine.setParameters(parameters); reference.setParameters(parameters);
+    engine.prepare(sampleRate); reference.prepare(sampleRate);
+    engine.process(left.data(), right.data(), static_cast<int>(count), &mask);
+    reference.process(refL.data(), refR.data(), static_cast<int>(count), &referenceMask);
+    int hits = 0, referenceHits = 0, measured = 0, stem = 0, arm = 0;
+    double maximumPowerError = 0.0;
+    const auto supported = [&mask](holotoner::ScopePoint point) {
+        const auto x = static_cast<int>(std::lround((point.x/0.4f+1.0f)*31.5f));
+        const auto y = static_cast<int>(std::lround((1.0f-(point.y-0.5f)/0.4f)*31.5f));
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx)
+                if (mask.at(x+dx,y+dy)>0.5f) return true;
+        return false;
+    };
+    for (std::size_t i = 32768; i < count; ++i) {
+        const auto power = static_cast<double>(left[i])*left[i]+static_cast<double>(right[i])*right[i];
+        const auto refPower = static_cast<double>(refL[i])*refL[i]+static_cast<double>(refR[i])*refR[i];
+        maximumPowerError = std::max(maximumPowerError, std::abs(power-refPower));
+        const auto point = holotoner::stereoToScopePoint(left[i]*5.0f,right[i]*5.0f);
+        const auto refPoint = holotoner::stereoToScopePoint(refL[i]*5.0f,refR[i]*5.0f);
+        if (std::hypot(point.x,point.y)<0.25f || std::hypot(point.x,point.y)>0.75f) continue;
+        ++measured;
+        hits += supported(point) ? 1 : 0;
+        stem += supported(point) && point.x < -0.1f && point.y > 0.45f ? 1 : 0;
+        arm += supported(point) && point.x > 0.0f && point.y < 0.4f ? 1 : 0;
+        referenceHits += supported(refPoint) ? 1 : 0;
+    }
+    std::cout << "Measured image support " << sampleRate << ": " << hits << '/' << measured
+              << ", unconstrained " << referenceHits << ", stem/arm " << stem << '/' << arm
+              << ", stereo power error " << maximumPowerError << '\n';
+    if (measured < 1000 || hits < measured*9/10 || hits < referenceHits + measured/4
+        || stem < 2000 || arm < 300
+        || maximumPowerError > 1.0e-7) {
+        std::cerr << "image constraint did not shape actual audio while retaining stereo energy\n";
+        ++failures;
     }
 }
 
@@ -687,8 +754,11 @@ int main()
     phaseImageProcessing(96000.0);
     for (const auto rate : {44100.0, 48000.0, 96000.0})
         for (const auto hz : {110.0, 440.0, 1760.0, 7040.0})
-            phasePreservesTone(rate, hz);
-    phasePreservesTone(48000.0, 440.0, true);
+            imageOffPreservesTone(rate, hz);
+    imageOffPreservesTone(48000.0, 440.0, true);
+    imageFieldMeasuredSupport(44100.0);
+    imageFieldMeasuredSupport(48000.0);
+    imageFieldMeasuredSupport(96000.0);
     if (failures != 0)
         std::cerr << failures << " test assertion(s) failed\n";
     return failures == 0 ? 0 : 1;

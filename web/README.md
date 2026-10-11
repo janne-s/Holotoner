@@ -5,7 +5,7 @@ This directory will contain the production browser wrapper around
 image-driven DSP contract has been validated through native listening; there
 will be no separate JavaScript audio implementation to drift away from the
 native product. The shared core already contains the deterministic image mask,
-plane projection, brightness-weighted static phase field, actual L/R scope
+plane projection, image-constrained moving phase field, actual L/R scope
 mapping and fixed-latency spatializer intended for the WebAssembly
 build.
 
@@ -18,8 +18,10 @@ The accepted boundary is:
 - AudioWorklet owns real-time audio scheduling.
 - The C++20 core is compiled to WebAssembly and performs the same geometry and
   DSP as the native formats.
-- Phase map processes the original source spectrum with a static unitary
-  mid/side phase field, not a moving scanner or replacement waveform.
+- Phase map uses bounded spectral phase drift and an off-thread projected
+  image steering field. The image stage rotates existing sample pairs without
+  changing their combined energy; it is nonlinear and may colour the sound.
+  Rebuild the field off the audio thread when geometry/projection changes.
   XY rectangle, Polar warp, processed-mask preview, threshold and B/W must
   retain the native semantics; the analyser must measure actual L/R samples.
 - User-selected images and audio remain local.

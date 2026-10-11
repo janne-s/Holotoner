@@ -64,6 +64,8 @@ int main()
     const auto restoredMask = restored.imageMask();
     check(mask != nullptr && restoredMask != nullptr && mask->values == restoredMask->values,
           "native state round-trip changed image map");
+    check(mask != nullptr && restoredMask != nullptr && mask->fieldAngles == restoredMask->fieldAngles,
+          "native state round-trip changed projected steering field");
     check(restored.state().getRawParameterValue("image_target")->load() == 3.0f,
           "phase target did not restore");
     check(std::abs(restored.state().getRawParameterValue("image_threshold")->load() - 0.6f) < 1.0e-6f,
@@ -74,6 +76,20 @@ int main()
     check(restored.state().getRawParameterValue("image_projection")->load() == 1.0f,
           "polar projection did not restore");
     set(processor, "image_projection", 0.0f);
+    const auto beforeMove = processor.imageMask();
+    set(processor, "position_x", 0.25f);
+    for (int i = 0; i < 300 && processor.imageMask() == beforeMove; ++i) {
+        juce::Thread::sleep(10);
+        juce::Timer::callPendingTimersSynchronously();
+    }
+    const auto moved = processor.imageMask();
+    check(moved != nullptr && beforeMove != nullptr && moved->fieldAngles != beforeMove->fieldAngles,
+          "geometry-only gesture did not rebuild steering field");
+    set(processor, "position_x", 0.0f);
+    for (int i = 0; i < 300 && processor.imageMask() == moved; ++i) {
+        juce::Thread::sleep(10);
+        juce::Timer::callPendingTimersSynchronously();
+    }
 
     processor.prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> buffer(2, 512);
@@ -108,8 +124,11 @@ int main()
     {
         juce::AudioBuffer<float> tone(2, 48000);
         for (int i = 0; i < tone.getNumSamples(); ++i) {
-            const auto value = static_cast<float>(0.2 * std::sin(2.0 * 3.141592653589793 * 440.0
-                                                               * static_cast<double>(i) / 48000.0));
+            double mixture = 0.0;
+            for (int partial = 1; partial <= 16; ++partial)
+                mixture += 0.009*std::sin(2.0*3.141592653589793*(97.0*partial+7.0*partial*partial)
+                    *static_cast<double>(i)/48000.0 + partial*2.399963229728653);
+            const auto value = static_cast<float>(mixture);
             tone.setSample(0, i, value);
             tone.setSample(1, i, value);
         }
@@ -125,7 +144,7 @@ int main()
         juce::Thread::sleep(10);
     check(processor.sourceKind() == holotoner::SourceKind::File, "native file source failed to load");
     float filePeak = 0.0f;
-    for (int block = 0; block < 100; ++block) {
+    for (int block = 0; block < 300; ++block) {
         buffer.clear();
         processor.processBlock(buffer, midi);
         filePeak = std::max(filePeak, buffer.getMagnitude(0, 512));

@@ -10,7 +10,7 @@
 
 namespace {
 
-constexpr int kStateVersion = 5;
+constexpr int kStateVersion = 6;
 constexpr int kOldestReadableStateVersion = 2;
 constexpr juce::int64 kMaximumImageFileBytes = 32 * 1024 * 1024;
 constexpr int kMaximumImageDimension = 1024;
@@ -560,6 +560,19 @@ void HolotonerProcessor::rebuildImageMaskIfNeeded()
     settings.amount = 1.0f;
     settings.threshold = imageThreshold_->load(std::memory_order_relaxed);
     settings.binary = imageBinary_->load(std::memory_order_relaxed) >= 0.5f;
+    settings.plane = planeTransform();
+    settings.projection = imageProjection_->load(std::memory_order_relaxed) >= 0.5f
+        ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
+    const auto& p = settings.plane;
+    const auto& old = builtMaskSettings_.plane;
+    const bool geometryChanged = settings.projection != builtMaskSettings_.projection
+        || std::abs(p.positionX-old.positionX) > 1.0e-6f
+        || std::abs(p.positionY-old.positionY) > 1.0e-6f
+        || std::abs(p.scaleX-old.scaleX) > 1.0e-6f
+        || std::abs(p.scaleY-old.scaleY) > 1.0e-6f
+        || std::abs(p.pitchDegrees-old.pitchDegrees) > 1.0e-6f
+        || std::abs(p.yawDegrees-old.yawDegrees) > 1.0e-6f
+        || std::abs(p.rollDegrees-old.rollDegrees) > 1.0e-6f;
     const auto image = imageDocument();
     const bool settingsChanged = !hasBuiltMaskSettings_
         || settings.channel != builtMaskSettings_.channel
@@ -569,7 +582,7 @@ void HolotonerProcessor::rebuildImageMaskIfNeeded()
         || settings.invert != builtMaskSettings_.invert
         || settings.binary != builtMaskSettings_.binary
         || std::abs(settings.threshold - builtMaskSettings_.threshold) > 1.0e-6f;
-    if (image == maskImage_ && !settingsChanged)
+    if (image == maskImage_ && !settingsChanged && !geometryChanged)
         return;
     auto mask = std::make_shared<holotoner::ImageMask>();
     if (image != nullptr)

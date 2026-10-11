@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numbers>
 
 namespace holotoner {
 namespace {
@@ -159,7 +160,67 @@ ImageMask buildImageMask(const RgbaImage& image, ImageMaskSettings settings)
             ++cursor;
         }
     }
+    buildImageField(result, settings.plane, settings.projection);
     return result;
+}
+
+void buildImageField(ImageMask& mask, PlaneTransform plane, PhaseProjection projection)
+{
+    mask.fieldPlane = plane;
+    mask.fieldProjection = projection;
+    mask.fieldReady = true;
+    plane.scaleX *= mask.aspectX;
+    plane.scaleY *= mask.aspectY;
+    const auto projected = projectPlane(plane);
+    const auto& a = projected.corners[0];
+    const auto& b = projected.corners[1];
+    const auto& d = projected.corners[3];
+    const auto bx = b.stereo - a.stereo, by = b.frequency - a.frequency;
+    const auto dx = d.stereo - a.stereo, dy = d.frequency - a.frequency;
+    const auto determinant = bx * dy - by * dx;
+    for (int row = 0; row < ImageMask::kFieldRows; ++row) {
+        const auto radius = (static_cast<float>(row) + 0.5f) / static_cast<float>(ImageMask::kFieldRows);
+        std::array<float, ImageMask::kFieldAngles> support {};
+        float maximum = 0.0f;
+        for (int column = 0; column < ImageMask::kFieldAngles; ++column) {
+            const auto angle = -0.5f * std::numbers::pi_v<float>
+                + std::numbers::pi_v<float> * static_cast<float>(column)
+                    / static_cast<float>(ImageMask::kFieldAngles - 1);
+            const auto x = projection == PhaseProjection::Cartesian
+                ? 2.0f * radius * std::sin(angle) : angle * 4.0f / std::numbers::pi_v<float>;
+            const auto y = projection == PhaseProjection::Cartesian
+                ? 2.0f * (radius * std::cos(angle) - 0.5f) : 4.0f * (radius - 0.5f);
+            if (std::abs(determinant) > 1.0e-6f) {
+                const auto u = ((x-a.stereo)*dy - (y-a.frequency)*dx) / determinant;
+                const auto v = (bx*(y-a.frequency) - by*(x-a.stereo)) / determinant;
+                if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+                    const auto px = u * static_cast<float>(kImageMaskWidth - 1);
+                    const auto py = (1.0f-v) * static_cast<float>(kImageMaskHeight - 1);
+                    const auto ix = static_cast<int>(px), iy = static_cast<int>(py);
+                    const auto tx = px-static_cast<float>(ix), ty = py-static_cast<float>(iy);
+                    const auto top = mask.at(ix,iy)*(1-tx) + mask.at(std::min(ix+1,63),iy)*tx;
+                    const auto bottom = mask.at(ix,std::min(iy+1,63))*(1-tx)
+                        + mask.at(std::min(ix+1,63),std::min(iy+1,63))*tx;
+                    support[static_cast<std::size_t>(column)] = top*(1-ty)+bottom*ty;
+                    maximum = std::max(maximum, support[static_cast<std::size_t>(column)]);
+                }
+            }
+        }
+        for (int column = 0; column < ImageMask::kFieldAngles; ++column) {
+            int nearest = column;
+            int distance = ImageMask::kFieldAngles;
+            if (maximum > 0.001f)
+                for (int candidate = 0; candidate < ImageMask::kFieldAngles; ++candidate)
+                    if (support[static_cast<std::size_t>(candidate)] >= 0.1f*maximum
+                        && std::abs(candidate-column) < distance) {
+                        nearest = candidate;
+                        distance = std::abs(candidate-column);
+                    }
+            mask.fieldAngles[static_cast<std::size_t>(row*ImageMask::kFieldAngles+column)]
+                = -0.5f * std::numbers::pi_v<float> + std::numbers::pi_v<float>
+                    * static_cast<float>(nearest) / static_cast<float>(ImageMask::kFieldAngles-1);
+        }
+    }
 }
 
 } // namespace holotoner
