@@ -33,6 +33,50 @@ Builds never install plug-ins into your DAW directories automatically.
 5. Choose **Polar warp** for a curved placement instead of a straight rectangle.
    Scale extends to 4×; Cartesian content outside the semicircle is clipped.
 
+### Text and Motion
+
+All image controls are visible on the left, audio controls on the right.
+Knobs use Spectral Space's small bipolar arc, horizontal/vertical drag and
+double-click reset. **Text** opens a row over the image view without resizing
+the window. Enter an emoji, emoticon or text, then press Return or **Use text**.
+Text is a bitmap source for the same phase-map engine, not another processing
+mode. **Whole** shows everything. **Characters** plays visible grapheme clusters
+(joined emoji, skin tones, flags and combining marks stay together); **Words**
+splits on whitespace. Blank clusters are skipped. Select **Frame** manually,
+or enable **Cycle**. The limits are 256 Unicode code points and 32 playback
+frames; oversized input reports an error and keeps the previous source.
+Loading **Image...** switches back to an ordinary image.
+
+Each Rotate X/Y/Z, Move X/Y and Scale X/Y knob has its own **Rate + ♪** directly
+below it. Multiple axes can move simultaneously at independent Hz/note values.
+Rate 0 with ♪ off is stationary. **Swing** adds a sinusoidal offset; rotation depth 100% means ±180°,
+position depth 100% means ±1, and scale depth 100% means half-to-double scale.
+**Spin** makes one full turn per cycle for rotation (Depth is not used there);
+position and scale still swing. Shape and Depth are shared across active axes.
+The base plane is unchanged: gestures and DAW automation remain independent
+of the internal motion offset. Position and scale stay within their bounds.
+All base geometry and new motion/playback parameters are exposed to the host;
+rotation display names are Rotation X/Y/Z, with the existing pitch/yaw/roll IDs.
+
+Each rate has Spectral Space's **♪** switch: off uses Hz; on replaces the rate
+with its note-value selector, including triplets and dotted notes. One Motion
+cycle or one text step lasts the selected note. In a DAW the clock follows
+host BPM and PPQ, including loops/seeks and negative preroll. Missing host PPQ
+falls back to an audio-sample beat accumulator. Standalone has **Tempo** in BPM
+and Play/Stop/Restart controls both local clocks. A whole note always means
+four quarter-note beats, not an arbitrary time-signature bar.
+
+Text rasterization and image-coordinate support maps are compiled on a worker,
+never on the audio thread. Geometry, independent motion phases and projection
+are consumed directly by audio, with 20 ms smoothing and continuous coefficient
+interpolation between FFT hops. They do not wait for a GUI-timer map rebuild.
+The old 64-pose motion banks are removed. Each frame stores a fixed 32 KiB
+nearest-support map, with no multiplying pose-bank memory cost. Text is fitted
+to visible ink bounds instead of leaving a small glyph in a mostly empty square.
+Very rapid motion can still blur the figure through smoothing and scope history.
+Character segmentation currently uses macOS's composed-character API;
+non-macOS builds explicitly reject Characters rather than split emoji incorrectly.
+
 Fill 100% deliberately makes all opaque pixels equally active. Saturating Gain
 can also erase image differences. The processed preview makes this visible.
 Original image aspect is preserved until you scale the two axes independently.
@@ -44,11 +88,13 @@ original audio with image-derived stereo/phase relationships and bounded,
 slow phase drift (0.11/0.17 Hz, independent of pitch and source level), following
 Spectral Space's phase-diffusion principle. It does not synthesize a carrier.
 
-The image stage projects the full mask into a 64-radius × 129-direction
-steering field OFF the audio thread. At the actual sample level, it finds image
-support and rotates the existing mid/side sample pair towards it. This retains
+The image stage compiles nearest occupied points in the full 64 × 64 mask
+OFF the audio thread. At the actual sample level, a bounded alternating
+projection queries that immutable map through the current continuous plane
+transform and finds image support at the sample's original radius. It rotates
+the existing mid/side sample pair towards that direction. This retains
 L²+R² at every sample: pixels cannot force audio level, gate empty rows or
-replace the waveform with its sign/envelope. Empty radial rows leave the
+replace the waveform with its sign/envelope. Unsupported radii leave the
 direction alone. A narrow seam fade avoids a jump where Polar Sample folds
 negative polarity. Field/geometry changes are smoothed over 20 ms.
 
@@ -81,7 +127,11 @@ not hidden behind the simplified editor.
 
 Image import accepts PNG, JPEG and GIF off-thread. Images are normalized and
 embedded in versioned session state, so the original file is not required to
-reopen a session. State version 7 removes the mode parameter. Versions 2–6
+reopen a session. State version 9 stores text metadata and every rendered
+frame as PNG, so reopening does not depend on the rendering machine's fonts.
+Version 8 text bitmaps are fitted to ink without re-rendering their fonts;
+its single Motion target migrates to the corresponding independent axis
+(old Scale maps to both scale axes). Version 7 removed the mode parameter. Versions 2–8
 remain readable with their images and other controls: old Phase/Place/Level
 sessions use the single phase-field engine; old mode Off becomes Amount 0.
 Old spectral sound is not retained as a dormant compatibility implementation.
@@ -123,16 +173,21 @@ cmake --build build/native-release --target holotoner-native-tests --parallel
 build/native-release/tests/holotoner-native-tests
 ```
 
-It checks embedded-image/parameter/field round-trips, legacy mode migration,
-geometry-only field rebuilds, a pixel-identical silent polar view with/without
+It checks embedded-image/text-frame/parameter/field round-trips, emoji
+segmentation/rendering, stale text jobs, transport seek/pause and synced
+Motion/text playback across blocks 1/31/97/512 at 44.1/48/96 kHz, legacy mode migration,
+audio-driven geometry changes without GUI ticks, a pixel-identical silent polar view with/without
 an image, file-source playback, actual
 sample history, and renders a diagnostic editor image to
-`/tmp/holotoner-phase-editor.png`. Its media fixtures are original, temporary
+`/tmp/holotoner-phase-editor.png`. An A regression at Gain 0.02 and threshold
+0.967 verifies a connected mask (958 active/connected pixels) and measured
+output support on both legs (about 99% in the tested radial range). UI tests
+check rotary controls and a non-resizing text overlay. Its media fixtures are original, temporary
 test data, not a bundled demo.
 
 Standalone, VST3 and AU build as universal arm64/x86_64 binaries. VST3 passes
 pluginval strictness 5. The native harness measured 60 seconds of Phase map,
-including sample history, in 0.33 seconds (about 0.56% of
+including sample history, in about 2.1 seconds (about 3.5% of
 one real-time stream's wall-clock budget). Timings are machine-specific, not
 a cross-device performance guarantee.
 

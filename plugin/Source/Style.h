@@ -25,6 +25,7 @@ void paintWell(juce::Graphics& graphics, juce::Rectangle<float> area);
 class HolotonerLook final : public juce::LookAndFeel_V4 {
 public:
     HolotonerLook();
+    void drawRotarySlider(juce::Graphics&,int,int,int,int,float,float,float,juce::Slider&) override;
 
     void drawButtonBackground(juce::Graphics&, juce::Button&, const juce::Colour&, bool highlighted, bool down) override;
     void drawComboBox(juce::Graphics&, int width, int height, bool down, int buttonX, int buttonY, int buttonWidth,

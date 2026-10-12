@@ -21,12 +21,24 @@ The accepted boundary is:
 - Phase map uses bounded spectral phase drift and an off-thread projected
   image steering field. The image stage rotates existing sample pairs without
   changing their combined energy; it is nonlinear and may colour the sound.
-  Rebuild the field off the audio thread when geometry/projection changes.
+  Compile the immutable nearest-support map in image coordinates off the audio
+  thread. Query it through continuous audio-driven geometry; do not recompile
+  poses or use an animation-frame timer to drive modulation.
   This is the only engine: no mode selector or retired spectral paths.
   Polar renders actual input/output samples only, with no target-image overlay.
   XY rectangle, Polar warp, processed-mask preview, threshold and B/W must
   retain the native semantics; the analyser must measure actual L/R samples.
 - User-selected images and audio remain local.
+- Match native Text/Motion semantics: rasterized text is an image source,
+  with Whole, grapheme-cluster Characters and whitespace-delimited Words.
+  Store rendered frames with text metadata, never depend on the original font
+  for reopening. Use proper Unicode grapheme segmentation in the browser.
+  Motion is additive to base geometry. ♪ uses the shared note/PPQ beat table;
+  the browser's local transport owns its audio-sample beat clock. Prepare
+  immutable image-coordinate support maps away from AudioWorklet. Each
+  geometry axis has an independent rate/♪ clock; preserve the native rotary,
+  image-left/audio-right layout and non-resizing text overlay. Budget frame memory
+  explicitly for mobile before implementing this wrapper.
 - GitHub Pages deployment must work from a project subpath and expose a visible
   link to corresponding source.
 

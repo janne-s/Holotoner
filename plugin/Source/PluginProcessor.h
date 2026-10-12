@@ -4,6 +4,7 @@
 #include "core/audio/SourcePlayer.h"
 #include "core/dsp/ImageSpatializer.h"
 #include "core/image/ImageMask.h"
+#include "core/geometry/Motion.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
@@ -60,6 +61,8 @@ public:
 
     juce::AudioProcessorValueTreeState& state() { return parameters_; }
     holotoner::PlaneTransform planeTransform() const;
+    holotoner::PlaneTransform displayedPlaneTransform() const;
+    static constexpr std::array<const char*,7> kMotionAxes {"pitch","yaw","roll","position_x","position_y","scale_x","scale_y"};
     MeterState meterState() const;
     struct ScopeSample { float inputLeft, inputRight, outputLeft, outputRight; };
     // UI-only read of a bounded, non-tearing atomic sample history.
@@ -83,9 +86,13 @@ public:
     static bool isSupportedAudioFile(const juce::File& file);
 
     void loadImageFile(const juce::File& file);
+    void setText(const juce::String& text);
+    juce::String text() const;
+    int textFrameCount() const;
     std::shared_ptr<const ImageDocument> imageDocument() const;
-    std::shared_ptr<const holotoner::ImageMask> imageMask() const { return masks_.currentShared(); }
-    bool isLoadingImage() const { return imageLoadsPending_.load() > 0; }
+    std::shared_ptr<const holotoner::ImageMask> imageMask() const;
+    bool isLoadingImage() const { return imageLoadsPending_.load() > 0 || bankPending_.load()
+        || mediaVersion_.load() != bankVersion_.load(); }
     juce::String lastImageMessage() const;
     static bool isSupportedImageFile(const juce::File& file);
 
@@ -93,9 +100,10 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout parameterLayout();
     void timerCallback() override;
     void setSourceMessage(const juce::String& message);
-    void loadImageData(juce::MemoryBlock data, juce::String name, std::uint64_t request);
+    void loadImageData(juce::MemoryBlock data, juce::String name, std::uint64_t request, bool embedded = false);
     void setImageMessage(const juce::String& message);
     void rebuildImageMaskIfNeeded();
+    void renderText(juce::String text, int layout, std::uint64_t request);
 
     juce::AudioProcessorValueTreeState parameters_;
     std::atomic<float>* positionX_ = nullptr;
@@ -115,6 +123,16 @@ private:
     std::atomic<float>* imageProjection_ = nullptr;
     std::atomic<float>* imageThreshold_ = nullptr;
     std::atomic<float>* imageBinary_ = nullptr;
+    std::atomic<float> *motionShape_, *motionDepth_,
+        *textLayout_, *textPlay_, *textFrame_, *textRate_, *textSync_, *localBpm_;
+    std::array<std::atomic<float>*,7> axisRate_ {}, axisSync_ {};
+    std::array<holotoner::CycleClock,7> axisClocks_;
+    holotoner::CycleClock textClock_;
+    double clockSampleRate_ = 48000;
+    std::uint64_t motionSamples_ = 0;
+    std::array<std::atomic<float>, 7> displayedPlane_ {};
+    std::atomic<bool> hasDisplayedPlane_ {false};
+    std::atomic<int> displayedTextFrame_ {0};
     holotoner::ImageSpatializer engine_;
     std::atomic<float> inputLeft_ {0.0f};
     std::atomic<float> inputRight_ {0.0f};
@@ -144,13 +162,28 @@ private:
     juce::String sourceMessage_;
     std::atomic<int> imageLoadsPending_ {0};
     std::atomic<std::uint64_t> imageRequest_ {0};
+    std::atomic<std::uint64_t> mediaVersion_ {0}, bankVersion_ {0};
     mutable std::mutex imageMutex_;
     std::shared_ptr<const ImageDocument> image_;
+    juce::String text_;
+    int renderedTextLayout_ = -1;
+    int rejectedTextLayout_ = -1;
+    std::vector<std::shared_ptr<const ImageDocument>> textFrames_;
+    // Preserve embedded media if a host saves immediately while asynchronous restore is still decoding.
+    std::unique_ptr<juce::XmlElement> pendingMediaState_;
     juce::String imageMessage_;
-    holotoner::SharedExchange<holotoner::ImageMask> masks_;
-    std::shared_ptr<const ImageDocument> maskImage_;
+    struct ImageFrame {
+        std::shared_ptr<const ImageDocument> document;
+        std::shared_ptr<const holotoner::ImageMask> mask;
+    };
+    struct ImageBank {
+        std::vector<ImageFrame> frames;
+    };
+    holotoner::SharedExchange<ImageBank> banks_;
+    std::vector<std::shared_ptr<const ImageDocument>> maskImages_;
+    std::atomic<bool> bankPending_ {false};
     holotoner::ImageMaskSettings builtMaskSettings_;
-    bool hasBuiltMaskSettings_ = false;
+    std::atomic<bool> hasBuiltMaskSettings_ {false};
     /** Jobs refer to media members, so the destructor waits for them. */
     juce::ThreadPool mediaLoader_ {1};
 

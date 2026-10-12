@@ -9,7 +9,7 @@ juce_add_plugin(Holotoner
     NEEDS_MIDI_INPUT FALSE
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
-    EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+    EDITOR_WANTS_KEYBOARD_FOCUS TRUE
     VST3_CATEGORIES Fx Spatial
     AU_MAIN_TYPE kAudioUnitType_Effect
     # A normal public build must not write into a user's plug-in directories.
@@ -23,6 +23,10 @@ target_sources(Holotoner PRIVATE
     Source/PluginProcessor.h
     Source/Style.cpp
     Source/Style.h)
+target_sources(Holotoner PRIVATE Source/TextSource.cpp Source/TextSource.h)
+if(APPLE)
+    target_link_libraries(Holotoner PRIVATE "-framework CoreFoundation")
+endif()
 
 target_compile_definitions(Holotoner PUBLIC
     JUCE_WEB_BROWSER=0

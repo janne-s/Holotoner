@@ -53,14 +53,15 @@ void ImageSpatializer::reset()
     phaseControls_.fill({});
     phaseInitialized_ = false;
     fieldTime_ = 0.0;
-    steeringBlend_ = 1.0f;
-    for (int row = 0; row < ImageMask::kFieldRows; ++row)
-        for (int column = 0; column < ImageMask::kFieldAngles; ++column) {
-            const auto at = static_cast<std::size_t>(row*ImageMask::kFieldAngles+column);
-            steering_[at] = -0.5f*std::numbers::pi_v<float> + std::numbers::pi_v<float>
-                *static_cast<float>(column)/static_cast<float>(ImageMask::kFieldAngles-1);
-        }
-    previousSteering_ = steering_;
+    geometryBlend_ = 1.0f;
+    fieldHasSupport_ = false;
+    supportValues_.fill(0);
+    fieldAspectX_ = fieldAspectY_ = 1;
+    imagePlane_ = previousImagePlane_ = projectPlane(parameters_.plane);
+    for (int y = 0; y < kImageMaskHeight; ++y)
+        for (int x = 0; x < kImageMaskWidth; ++x)
+            nearest_[static_cast<std::size_t>(y*kImageMaskWidth+x)] = {static_cast<float>(x),static_cast<float>(y)};
+    previousNearest_ = nearest_;
 
 }
 
@@ -147,7 +148,7 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     fft_.transform(spectrum_, false);
 
     const auto widthMagnitude = std::clamp(0.5 * static_cast<double>(projection.stereoSpan), 0.0, 2.0);
-    const auto signedWidth = projection.signedFacing < 0.0f ? -widthMagnitude : widthMagnitude;
+    const auto signedWidth = widthMagnitude*static_cast<double>(projection.signedFacing);
     const auto basePosition = static_cast<double>(smoothedParameters_.plane.positionX);
     const std::complex<double> imaginary {0.0, 1.0};
     const auto half = kFftSize / 2;
@@ -185,7 +186,12 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     if (mask != targetMaskIdentity_) {
         targetMaskIdentity_ = mask;
         targetMask_ = mask != nullptr ? *mask : ImageMask {};
-        targetMaskPresence_ = targetMask_.hasSource ? 1.0 : 0.0;
+        targetMaskPresence_ = targetMask_.hasPhasePoints ? 1.0 : 0.0;
+        if (targetMask_.hasNearestSupport) {
+            fieldHasSupport_ = true;
+            supportValues_ = targetMask_.values;
+            fieldAspectX_ = targetMask_.aspectX; fieldAspectY_ = targetMask_.aspectY;
+        }
     }
     const auto smooth = [this](auto& current, const auto target) {
         using Value = std::remove_reference_t<decltype(current)>;
@@ -197,47 +203,107 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     smooth(currentPlane.positionY, targetPlane.positionY);
     smooth(currentPlane.scaleX, targetPlane.scaleX);
     smooth(currentPlane.scaleY, targetPlane.scaleY);
-    smooth(currentPlane.pitchDegrees, targetPlane.pitchDegrees);
-    smooth(currentPlane.yawDegrees, targetPlane.yawDegrees);
-    smooth(currentPlane.rollDegrees, targetPlane.rollDegrees);
+    const auto smoothAngle = [this](float& current, float target) {
+        current = std::remainder(current + static_cast<float>(frameSmoothing_)
+            * std::remainder(target-current, 360.0f), 360.0f);
+    };
+    smoothAngle(currentPlane.pitchDegrees, targetPlane.pitchDegrees);
+    smoothAngle(currentPlane.yawDegrees, targetPlane.yawDegrees);
+    smoothAngle(currentPlane.rollDegrees, targetPlane.rollDegrees);
     smooth(smoothedParameters_.imageAmount, parameters_.imageAmount);
-    previousSteering_ = steering_;
-    steeringBlend_ = 0.0f;
-    if (targetMask_.fieldReady)
-        for (std::size_t i = 0; i < steering_.size(); ++i)
-            smooth(steering_[i], targetMask_.fieldAngles[i]);
+    geometryBlend_ = 0.0f;
     smooth(maskPresence_, targetMaskPresence_);
+    previousNearest_ = nearest_;
+    if (targetMask_.hasNearestSupport)
+        for (std::size_t i = 0; i < nearest_.size(); ++i) {
+            smooth(nearest_[i].x,targetMask_.nearestSupport[i].x);
+            smooth(nearest_[i].y,targetMask_.nearestSupport[i].y);
+        }
+    auto imageTransform = smoothedParameters_.plane;
+    imageTransform.scaleX *= fieldAspectX_;
+    imageTransform.scaleY *= fieldAspectY_;
+    previousImagePlane_ = imagePlane_;
+    imagePlane_ = projectPlane(imageTransform);
 }
 
 void ImageSpatializer::constrainField(double& left, double& right)
 {
     const auto mid = 0.5*(left+right), side = 0.5*(right-left);
     const auto level = std::hypot(mid, side);
-    const auto amount = maskPresence_*smoothedParameters_.imageAmount;
-    steeringBlend_ = std::min(1.0f, steeringBlend_ + 1.0f/static_cast<float>(kHopSize));
-    if (level < 1.0e-9 || amount < 1.0e-6 || !targetMask_.fieldReady)
+    geometryBlend_ = std::min(1.0f, geometryBlend_ + 1.0f/static_cast<float>(kHopSize));
+    const auto facing = previousImagePlane_.signedFacing
+        + geometryBlend_*(imagePlane_.signedFacing-previousImagePlane_.signedFacing);
+    const auto amount = maskPresence_*smoothedParameters_.imageAmount*std::abs(facing);
+    if (level < 1.0e-9 || amount < 1.0e-6 || !fieldHasSupport_)
         return;
     const auto polarity = mid >= 0.0 ? 1.0 : -1.0;
     const auto angle = std::atan2(polarity*side, std::abs(mid));
     // Same calibrated level axis as the measured +14 dB scope. No audio gain is applied.
     const auto radius = std::clamp(1.0 + std::log10(std::max(level*5.0, 1.0e-6))/3.0, 0.0, 1.0);
-    const auto rowPosition = std::clamp(radius*ImageMask::kFieldRows-0.5, 0.0,
-                                      static_cast<double>(ImageMask::kFieldRows-1));
-    const auto columnPosition = std::clamp((angle/std::numbers::pi+0.5)
-        *static_cast<double>(ImageMask::kFieldAngles-1), 0.0, static_cast<double>(ImageMask::kFieldAngles-1));
-    const auto row = static_cast<int>(rowPosition), column = static_cast<int>(columnPosition);
-    const auto nextRow = std::min(row+1, ImageMask::kFieldRows-1);
-    const auto nextColumn = std::min(column+1, ImageMask::kFieldAngles-1);
-    const auto readAngle = [this](int r, int c) {
-        const auto at = static_cast<std::size_t>(r*ImageMask::kFieldAngles+c);
-        return static_cast<double>(previousSteering_[at] + steeringBlend_*(steering_[at]-previousSteering_[at]));
+    const auto corner = [this](int i) {
+        const auto& p = previousImagePlane_.corners[static_cast<std::size_t>(i)];
+        const auto& q = imagePlane_.corners[static_cast<std::size_t>(i)];
+        return ProjectedPoint {p.stereo+geometryBlend_*(q.stereo-p.stereo),
+            p.frequency+geometryBlend_*(q.frequency-p.frequency),0};
     };
-    const auto tx = columnPosition-column, ty = rowPosition-row;
-    const auto top = readAngle(row,column)*(1-tx)+readAngle(row,nextColumn)*tx;
-    const auto bottom = readAngle(nextRow,column)*(1-tx)+readAngle(nextRow,nextColumn)*tx;
+    const auto a = corner(0),b = corner(1),d = corner(3);
+    const auto bx = b.stereo-a.stereo, by = b.frequency-a.frequency;
+    const auto dx = d.stereo-a.stereo, dy = d.frequency-a.frequency;
+    const auto determinant = static_cast<double>(bx*dy-by*dx);
+    if (std::abs(determinant) < 1.0e-7) return;
+    const auto imageCoordinates = [&](double direction) {
+        const auto x = parameters_.phaseProjection == PhaseProjection::Cartesian
+            ? 2*radius*std::sin(direction) : direction*4/std::numbers::pi;
+        const auto y = parameters_.phaseProjection == PhaseProjection::Cartesian
+            ? 2*(radius*std::cos(direction)-0.5) : 4*(radius-0.5);
+        return ImageMask::PhasePoint {static_cast<float>(63*((x-a.stereo)*dy-(y-a.frequency)*dx)/determinant),
+            static_cast<float>(63*(1-(bx*(y-a.frequency)-by*(x-a.stereo))/determinant))};
+    };
+    auto targetAngle = angle;
+    bool supported = false;
+    for (int attempt = 0; attempt < 2 && !supported; ++attempt) {
+        targetAngle = attempt == 0 ? angle : -std::copysign(0.8,angle);
+        // Alternating projection: image support, then the original sample's radius.
+        // Only query an immutable image-coordinate map; no rasterization/field compilation here.
+        for (int iteration = 0; iteration < 16; ++iteration) {
+            const auto query = imageCoordinates(targetAngle);
+            const auto px = std::clamp(query.x,0.0f,63.0f), py = std::clamp(query.y,0.0f,63.0f);
+            const auto ix = static_cast<int>(px), iy = static_cast<int>(py);
+            const auto nx = std::min(ix+1,63), ny = std::min(iy+1,63);
+            const auto tx = px-static_cast<float>(ix), ty = py-static_cast<float>(iy);
+            const auto read = [&](int x,int y) {
+                const auto at = static_cast<std::size_t>(y*64+x);
+                const auto& p = previousNearest_[at]; const auto& q = nearest_[at];
+                return ImageMask::PhasePoint {p.x+geometryBlend_*(q.x-p.x),p.y+geometryBlend_*(q.y-p.y)};
+            };
+            const auto p = read(ix,iy), q = read(nx,iy), r = read(ix,ny), s = read(nx,ny);
+            const auto nearX = (p.x*(1-tx)+q.x*tx)*(1-ty)+(r.x*(1-tx)+s.x*tx)*ty;
+            const auto nearY = (p.y*(1-tx)+q.y*tx)*(1-ty)+(r.y*(1-tx)+s.y*tx)*ty;
+            const auto u = nearX/63, v = 1-nearY/63;
+            const auto worldX = a.stereo+u*bx+v*dx, worldY = a.frequency+u*by+v*dy;
+            const auto scopeX = 0.5*worldX, scopeY = 0.5+0.5*worldY;
+            const auto previousAngle = targetAngle;
+            if (parameters_.phaseProjection == PhaseProjection::Cartesian) {
+                if (scopeY < 0) break;
+                targetAngle = std::atan2(scopeX,scopeY);
+            } else targetAngle = std::clamp(static_cast<double>(worldX)*std::numbers::pi/4,-0.5*std::numbers::pi,0.5*std::numbers::pi);
+            if (std::abs(targetAngle-previousAngle) < 1.0e-5) break;
+        }
+        const auto finalPoint = imageCoordinates(targetAngle);
+        if (!std::isfinite(finalPoint.x) || !std::isfinite(finalPoint.y)
+            || finalPoint.x < -2 || finalPoint.x > 65 || finalPoint.y < -2 || finalPoint.y > 65) continue;
+        const auto fx = static_cast<int>(std::lround(finalPoint.x)), fy = static_cast<int>(std::lround(finalPoint.y));
+        for (int y = -2; y <= 2; ++y)
+            for (int x = -2; x <= 2; ++x) {
+                const auto px = fx+x,py = fy+y;
+                if (px>=0 && px<64 && py>=0 && py<64)
+                    supported = supported || supportValues_[static_cast<std::size_t>(py*64+px)]>0.001f;
+            }
+    }
+    if (!supported) return; // No support at this radius: never invent level to fill the image.
     // Avoid a waveform discontinuity at Polar Sample's polarity-fold seam.
     const auto seam = std::min(1.0, std::abs(mid)/(0.05*level));
-    const auto rotation = amount*seam*(top*(1-ty)+bottom*ty-angle);
+    const auto rotation = amount*seam*(targetAngle-angle);
     const auto c = std::cos(rotation), s = std::sin(rotation);
     // Rotate the EXISTING sample vector: L²+R² is unchanged at every sample.
     // No pixel-derived amplitude, envelope, sign-only carrier or silent-row gating.
@@ -279,7 +345,8 @@ void ImageSpatializer::applyPhase(std::size_t bin, std::complex<double> left, st
                                   double signedWidth, std::complex<double>& outLeft,
                                   std::complex<double>& outRight) const
 {
-    const auto amount = maskPresence_ * smoothedParameters_.imageAmount;
+    const auto facing = std::abs(std::cos(static_cast<double>(smoothedParameters_.plane.yawDegrees)*std::numbers::pi/180));
+    const auto amount = maskPresence_ * smoothedParameters_.imageAmount*facing;
     if (amount < 1.0e-9)
         return;
     const auto hz = static_cast<double>(bin) * sampleRate_ / static_cast<double>(kFftSize);

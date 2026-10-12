@@ -1,4 +1,5 @@
 #include "Style.h"
+#include <cmath>
 
 namespace holotoner_style {
 
@@ -53,6 +54,32 @@ void HolotonerLook::drawButtonBackground(juce::Graphics& graphics, juce::Button&
         graphics.setColour(holotoner_style::link.withAlpha(0.8f));
         graphics.drawRoundedRectangle(bounds, holotoner_style::corner, 1.0f);
     }
+}
+
+void HolotonerLook::drawRotarySlider(juce::Graphics& g,int x,int y,int width,int height,
+                                   float position,float start,float end,juce::Slider& slider)
+{
+    // Spectral Space's small bipolar arc and indicator, not JUCE's default filled knob.
+    constexpr float stroke = 2.5f;
+    const auto bounds = juce::Rectangle<int>(x,y,width,height).toFloat();
+    const auto centre = bounds.getCentre();
+    const auto radius = std::min(bounds.getWidth(),bounds.getHeight())*0.5f-stroke;
+    juce::Path track;
+    track.addCentredArc(centre.x,centre.y,radius,radius,0,start,end,true);
+    g.setColour(holotoner_style::grid);
+    g.strokePath(track,juce::PathStrokeType(stroke,juce::PathStrokeType::curved,juce::PathStrokeType::rounded));
+    const bool bipolar = slider.getMinimum()<0 && slider.getMaximum()>0;
+    const auto from = start + (bipolar ? static_cast<float>(slider.valueToProportionOfLength(0)) : 0)*(end-start);
+    const auto angle = start+position*(end-start);
+    if (std::abs(angle-from)>0.001f) {
+        juce::Path value;
+        value.addCentredArc(centre.x,centre.y,radius,radius,0,std::min(from,angle),std::max(from,angle),true);
+        g.setColour(slider.isEnabled() ? holotoner_style::signal : holotoner_style::textFaint);
+        g.strokePath(value,juce::PathStrokeType(stroke,juce::PathStrokeType::curved,juce::PathStrokeType::rounded));
+    }
+    g.setColour(slider.isMouseOverOrDragging() ? holotoner_style::linkLight
+        : holotoner_style::text.withAlpha(slider.isEnabled() ? 0.85f : 0.35f));
+    g.drawLine({centre.getPointOnCircumference(radius*0.35f,angle),centre.getPointOnCircumference(radius-3,angle)},1.6f);
 }
 
 void HolotonerLook::drawComboBox(juce::Graphics& graphics, int width, int height, bool, int, int, int, int,

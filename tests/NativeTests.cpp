@@ -1,4 +1,5 @@
 #include "plugin/Source/PluginProcessor.h"
+#include "plugin/Source/TextSource.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <chrono>
 #include <cmath>
@@ -25,6 +26,304 @@ bool waitForMask(HolotonerProcessor& processor)
             return true;
     }
     return false;
+}
+
+class TestPlayHead final : public juce::AudioPlayHead {
+public:
+    double ppq = 0, bpm = 120;
+    bool playing = true;
+    juce::Optional<PositionInfo> getPosition() const override
+    {
+        PositionInfo info;
+        info.setPpqPosition(ppq); info.setBpm(bpm); info.setIsPlaying(playing);
+        return info;
+    }
+};
+
+void textAndMotionTests()
+{
+    juce::String error;
+    const auto emoji = juce::String::fromUTF8("👨‍👩‍👧‍👦 👍🏽 🇫🇮 á");
+    check(textSource::segments(emoji,1,error).size() == 4 && error.isEmpty(),
+          "grapheme playback split a joined emoji, modifier, flag or combining character");
+    check(textSource::segments("one  two\nthree",2,error).size() == 3,"word segmentation failed");
+    auto family = textSource::render(juce::String::fromUTF8("👨‍👩‍👧‍👦"));
+    int opaque = 0;
+    for (int y = 0; y < family.getHeight(); ++y)
+        for (int x = 0; x < family.getWidth(); ++x) opaque += family.getPixelAt(x,y).getAlpha() > 0 ? 1 : 0;
+    check(opaque > 1000, "emoji rendering produced an empty image");
+    juce::FileOutputStream emojiOutput(juce::File("/tmp/holotoner-emoji.png"));
+    emojiOutput.setPosition(0); emojiOutput.truncate();
+    juce::PNGImageFormat png;
+    png.writeImageToStream(family,emojiOutput);
+
+    HolotonerProcessor text;
+    set(text,"text_layout",1);
+    text.setText(emoji);
+    check(waitForMask(text) && text.textFrameCount() == 4,"text source frames failed to publish");
+    const auto first = text.imageMask();
+    juce::MemoryBlock saved;
+    text.getStateInformation(saved);
+    HolotonerProcessor restored;
+    restored.setStateInformation(saved.getData(),static_cast<int>(saved.getSize()));
+    juce::MemoryBlock immediate;
+    restored.getStateInformation(immediate);
+    auto immediateXml = juce::AudioProcessor::getXmlFromBinary(immediate.getData(),static_cast<int>(immediate.getSize()));
+    check(immediateXml != nullptr && immediateXml->getChildByName("Text") != nullptr,
+        "saving during asynchronous text restore lost embedded media");
+    check(waitForMask(restored) && restored.text() == emoji && restored.textFrameCount() == 4,
+          "text metadata or embedded frames did not restore");
+    check(first != nullptr && restored.imageMask() != nullptr && first->values == restored.imageMask()->values,
+          "text restore re-rasterized or changed embedded bitmap");
+    {
+        auto textEditor = std::unique_ptr<juce::AudioProcessorEditor>(restored.createEditor());
+        for (auto* child : textEditor->getChildren())
+            if (auto* button = dynamic_cast<juce::TextButton*>(child);
+                button != nullptr && button->getButtonText() == "Text")
+                { button->setToggleState(true,juce::dontSendNotification); button->onClick(); }
+        textEditor->resized();
+        auto snapshot = textEditor->createComponentSnapshot(textEditor->getLocalBounds(),true,1.0f);
+        juce::FileOutputStream output(juce::File("/tmp/holotoner-text-motion-editor.png"));
+        output.setPosition(0); output.truncate();
+        check(png.writeImageToStream(snapshot,output),"expanded text/motion snapshot failed");
+        textEditor->setSize(900,textEditor->getConstrainer()->getMinimumHeight());
+        auto small = textEditor->createComponentSnapshot(textEditor->getLocalBounds(),true,1.0f);
+        juce::FileOutputStream smallOutput(juce::File("/tmp/holotoner-text-motion-small.png"));
+        smallOutput.setPosition(0); smallOutput.truncate();
+        check(png.writeImageToStream(small,smallOutput),"small text/motion snapshot failed");
+    }
+    {
+        auto legacy = juce::AudioProcessor::getXmlFromBinary(saved.getData(),static_cast<int>(saved.getSize()));
+        legacy->setAttribute("format_version",8);
+        auto* oldText = legacy->getChildByName("Text");
+        oldText->removeAttribute("renderer_version");
+        oldText->setAttribute("value","A"); oldText->setAttribute("layout",0);
+        while (auto* child = oldText->getFirstChildElement()) oldText->removeChildElement(child,true);
+        juce::Image inset(juce::Image::ARGB,512,512,true);
+        juce::Graphics g(inset); g.setColour(juce::Colours::white); g.setFont(juce::FontOptions(180.0f));
+        g.drawFittedText("A",inset.getBounds().reduced(28),juce::Justification::centred,8,0.05f);
+        juce::MemoryBlock bytes; juce::MemoryOutputStream encoded(bytes,false);
+        png.writeImageToStream(inset,encoded);
+        auto* frame = oldText->createNewChildElement("Frame"); frame->setAttribute("name","A");
+        frame->addTextElement(bytes.toBase64Encoding());
+        for (const auto& [id,value] : std::array<std::pair<const char*,float>,3> {
+            std::pair {"motion_target",6.0f},{"motion_rate",0.7f},{"motion_rate_sync",12.0f}}) {
+            auto* parameter = legacy->createNewChildElement("PARAM");
+            parameter->setAttribute("id",id); parameter->setAttribute("value",value);
+        }
+        juce::MemoryBlock oldState; juce::AudioProcessor::copyXmlToBinary(*legacy,oldState);
+        restored.setStateInformation(oldState.getData(),static_cast<int>(oldState.getSize()));
+        check(waitForMask(restored),"version 8 text/motion migration timed out");
+        int active = 0;
+        if (const auto mask = restored.imageMask())
+            for (const auto value : mask->values) active += value>0.5f ? 1 : 0;
+        check(active>300,"saved inset A did not migrate to fitted ink");
+        check(std::abs(restored.state().getRawParameterValue("scale_x_rate")->load()-0.7f)<1.0e-6f
+            && std::abs(restored.state().getRawParameterValue("scale_y_rate")->load()-0.7f)<1.0e-6f
+            && std::abs(restored.state().getRawParameterValue("scale_y_rate_sync")->load()-12)<1.0e-6f,
+            "legacy Scale motion did not migrate to both independent axes");
+        restored.getStateInformation(oldState);
+        auto clean = juce::AudioProcessor::getXmlFromBinary(oldState.getData(),static_cast<int>(oldState.getSize()));
+        check(clean->getChildByName("Text")->getIntAttribute("renderer_version")==2
+            && !clean->toString().contains("motion_target"),"legacy text/motion metadata remained in resaved state");
+    }
+    text.setText("newest");
+    text.setText("OK");
+    check(waitForMask(text) && text.text() == "OK" && text.textFrameCount() == 2,"stale text job replaced latest source");
+    text.setText(juce::String::repeatedString("a",33));
+    for (int i = 0; i < 100 && text.isLoadingImage(); ++i) { juce::Thread::sleep(10); juce::Timer::callPendingTimersSynchronously(); }
+    check(text.text() == "OK" && text.lastImageMessage().isNotEmpty(),"oversized text silently truncated or lost source");
+
+    for (const auto rate : {44100.0,48000.0,96000.0}) {
+        std::vector<float> reference;
+        for (const auto blockSize : {512,1,31,97}) {
+            HolotonerProcessor moving;
+            moving.setSourceKind(holotoner::SourceKind::Input);
+            set(moving,"text_layout",2);
+            set(moving,"motion_shape",1);
+            set(moving,"roll_rate_sync",15);
+            set(moving,"position_x_rate_sync",20);
+            set(moving,"scale_y_rate",0.17f);
+            set(moving,"text_play",1);
+            set(moving,"text_rate_sync",9); // Sixteenth-note word steps.
+            moving.setText("L T");
+            check(waitForMask(moving),"motion field compilation timed out");
+            TestPlayHead head;
+            moving.setPlayHead(&head);
+            moving.prepareToPlay(rate,blockSize);
+            const auto baseRoll = moving.planeTransform().rollDegrees;
+            std::vector<float> result;
+            juce::MidiBuffer midi;
+            constexpr int total = 32768;
+            result.reserve(total*2);
+            for (int offset = 0; offset < total;) {
+                const int count = std::min(blockSize,total-offset);
+                juce::AudioBuffer<float> audio(2,count);
+                for (int i = 0; i < count; ++i) {
+                    const float value = static_cast<float>(0.1*std::sin(2*3.141592653589793*173*(offset+i)/rate)
+                        + 0.08*std::sin(2*3.141592653589793*619*(offset+i)/rate));
+                    audio.setSample(0,i,value); audio.setSample(1,i,value);
+                }
+                head.ppq = 2.0*offset/rate;
+                moving.processBlock(audio,midi);
+                for (int i = 0; i < count; ++i) {
+                    result.push_back(audio.getSample(0,i)); result.push_back(audio.getSample(1,i));
+                }
+                offset += count;
+            }
+            if (reference.empty()) reference = result;
+            else {
+                float difference = 0;
+                for (std::size_t i = 0; i < result.size(); ++i) difference = std::max(difference,std::abs(result[i]-reference[i]));
+                std::cout << "Synced text/motion partition " << rate << '/' << blockSize << ": " << difference << '\n';
+                check(difference < 1.0e-5f,"audio-timed text/motion depends on host block size");
+            }
+            check(std::abs(moving.planeTransform().rollDegrees-baseRoll) < 1.0e-6f,"Motion wrote host base rotation");
+            head.ppq = 0.25; // One sixteenth step: frame T.
+            juce::AudioBuffer<float> audio(2,512); audio.clear();
+            moving.processBlock(audio,midi);
+            check(moving.imageDocument()->name == "T","host seek did not select the PPQ text frame");
+            head.ppq = -0.25; moving.processBlock(audio,midi);
+            check(moving.imageDocument()->name == "T","negative PPQ frame selection failed");
+            head.playing = false;
+            // Let the normal geometry/field smoothing settle after the seek.
+            for (int i = 0; i < 64; ++i) moving.processBlock(audio,midi);
+            const auto paused = moving.displayedPlaneTransform();
+            moving.processBlock(audio,midi);
+            check(std::abs(paused.rollDegrees-moving.displayedPlaneTransform().rollDegrees)<1.0e-6f,"stopped transport advanced synced motion");
+            moving.setPlayHead(nullptr);
+        }
+    }
+    juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Standalone);
+    HolotonerProcessor local;
+    juce::AudioProcessor::setTypeOfNextNewPlugin(juce::AudioProcessor::wrapperType_Undefined);
+    set(local,"text_layout",2); set(local,"text_play",1); set(local,"text_rate_sync",15);
+    set(local,"motion_shape",1); set(local,"roll_rate_sync",15);
+    local.setText("L T");
+    check(waitForMask(local),"Standalone text/motion failed to compile");
+    local.prepareToPlay(48000,512);
+    juce::AudioBuffer<float> audio(2,512); juce::MidiBuffer midi;
+    for (int i = 0; i < 48; ++i) local.processBlock(audio,midi);
+    check(local.imageDocument()->name == "T","Standalone 120 BPM clock failed");
+    local.setSourcePlaying(false);
+    for (int i = 0; i < 64; ++i) local.processBlock(audio,midi);
+    const auto stopped = local.displayedPlaneTransform();
+    for (int i = 0; i < 64; ++i) local.processBlock(audio,midi);
+    check(local.imageDocument()->name == "T"
+        && std::abs(stopped.rollDegrees-local.displayedPlaneTransform().rollDegrees)<1.0e-6f,
+        "Standalone Stop advanced text or Motion");
+    set(local,"tempo",60);
+    local.setSourcePlaying(true);
+    for (int i = 0; i < 48; ++i) local.processBlock(audio,midi);
+    check(local.imageDocument()->name == "T","Standalone tempo change ignored or reset the beat clock");
+    local.restartSource(); local.processBlock(audio,midi);
+    check(local.imageDocument()->name == "L","Standalone Restart did not reset the text clock");
+    set(local,"text_rate_sync",0); set(local,"text_rate",1);
+    local.prepareToPlay(48000,512);
+    for (int i = 0; i < 100; ++i) local.processBlock(audio,midi);
+    check(local.imageDocument()->name == "T","free-Hz text playback failed");
+}
+
+void letterARegression()
+{
+    HolotonerProcessor processor;
+    processor.setSourceKind(holotoner::SourceKind::Input);
+    set(processor,"image_gain",0.02f);
+    set(processor,"image_binary",1);
+    set(processor,"image_threshold",0.967f);
+    processor.setText("A");
+    check(waitForMask(processor),"A raster/mask failed to publish");
+    const auto mask = processor.imageMask();
+    if (mask == nullptr) return;
+    int active = 0;
+    std::array<bool,4096> visited {};
+    std::vector<int> queue;
+    int largest = 0;
+    for (int i = 0; i < 4096; ++i) {
+        if (mask->values[static_cast<std::size_t>(i)]<0.5f) continue;
+        ++active;
+        if (visited[static_cast<std::size_t>(i)]) continue;
+        queue.clear(); queue.push_back(i); visited[static_cast<std::size_t>(i)] = true;
+        for (std::size_t next = 0; next < queue.size(); ++next) {
+            const int px = queue[next]%64,py = queue[next]/64;
+            for (int y = -1; y <= 1; ++y)
+                for (int x = -1; x <= 1; ++x) {
+                    const int nx = px+x,ny = py+y;
+                    if (nx<0 || nx>=64 || ny<0 || ny>=64) continue;
+                    const auto at = static_cast<std::size_t>(ny*64+nx);
+                    if (!visited[at] && mask->values[at]>=0.5f) {
+                        visited[at] = true; queue.push_back(static_cast<int>(at));
+                    }
+                }
+        }
+        largest = std::max(largest,static_cast<int>(queue.size()));
+    }
+    std::cout << "A active/largest-connected pixels: " << active << '/' << largest << '\n';
+    check(active>300 && largest>=active*9/10,"A was reduced to disconnected dots by thresholding");
+    set(processor,"image_threshold",1);
+    const auto beforeEndpoint = processor.imageMask();
+    for (int i = 0; i < 300 && processor.imageMask()==beforeEndpoint; ++i) {
+        juce::Thread::sleep(10); juce::Timer::callPendingTimersSynchronously();
+    }
+    check(processor.imageMask()!=nullptr && processor.imageMask()->hasNearestSupport,"threshold 100% erased pure-white ink");
+    set(processor,"image_threshold",0.967f);
+    const auto endpoint = processor.imageMask();
+    for (int i = 0; i < 300 && processor.imageMask()==endpoint; ++i) {
+        juce::Thread::sleep(10); juce::Timer::callPendingTimersSynchronously();
+    }
+    processor.prepareToPlay(48000,512);
+    juce::AudioBuffer<float> buffer(2,512); juce::MidiBuffer midi;
+    int hits = 0,total = 0,left = 0,right = 0;
+    for (int block = 0; block < 300; ++block) {
+        for (int i = 0; i < 512; ++i) {
+            double value = 0;
+            for (int p = 1; p <= 16; ++p)
+                value += 0.009*std::sin(2*3.141592653589793*(97.0*p+7.0*p*p)*(block*512+i)/48000+p*2.399963229728653);
+            buffer.setSample(0,i,static_cast<float>(value)); buffer.setSample(1,i,static_cast<float>(value));
+        }
+        processor.processBlock(buffer,midi);
+        if (block<64) continue;
+        for (int i = 0; i < 512; ++i) {
+            const auto point = holotoner::stereoToScopePoint(buffer.getSample(0,i)*5,buffer.getSample(1,i)*5);
+            const auto radius = std::hypot(point.x,point.y);
+            if (radius<0.35f || radius>0.8f) continue;
+            const int px = static_cast<int>(std::lround((point.x*2+1)*31.5f));
+            const int py = static_cast<int>(std::lround((2-2*point.y)*31.5f));
+            bool supported = false;
+            for (int y = -2; y <= 2; ++y)
+                for (int x = -2; x <= 2; ++x) supported = supported || mask->at(px+x,py+y)>0.5f;
+            ++total; hits += supported ? 1 : 0;
+            left += supported && point.x < -0.05f ? 1 : 0;
+            right += supported && point.x > 0.05f ? 1 : 0;
+        }
+    }
+    std::cout << "A measured support: " << hits << '/' << total << ", left/right: " << left << '/' << right << '\n';
+    check(total>1000 && hits>total*8/10 && left>500 && right>500,"actual polar audio did not retain both legs of A");
+    auto editor = std::unique_ptr<juce::AudioProcessorEditor>(processor.createEditor());
+    const auto before = editor->getBounds();
+    std::function<void(juce::Component&,int&,bool&)> inspect = [&](juce::Component& c,int& count,bool& rotary) {
+        if (auto* slider = dynamic_cast<juce::Slider*>(&c)) {
+            ++count; rotary = rotary && slider->getSliderStyle() == juce::Slider::RotaryHorizontalVerticalDrag;
+        }
+        for (auto* child : c.getChildren()) inspect(*child,count,rotary);
+    };
+    int knobs = 0; bool rotary = true;
+    inspect(*editor,knobs,rotary);
+    check(knobs>=22 && rotary,"image/audio controls were hidden or linear sliders remained");
+    for (auto* child : editor->getChildren())
+        if (auto* button = dynamic_cast<juce::TextButton*>(child); button != nullptr && button->getButtonText()=="Text") {
+            button->setToggleState(true,juce::dontSendNotification); button->onClick();
+            check(editor->getBounds()==before,"Text overlay resized the editor");
+            button->setToggleState(false,juce::dontSendNotification); button->onClick();
+        }
+    auto snapshot = editor->createComponentSnapshot(editor->getLocalBounds(),true,1);
+    juce::FileOutputStream output(juce::File("/tmp/holotoner-letter-a-editor.png"));
+    output.setPosition(0); output.truncate();
+    juce::PNGImageFormat png; check(png.writeImageToStream(snapshot,output),"A snapshot failed");
+    // Base automation is now consumed on audio, not waiting for a message-thread map rebuild.
+    set(processor,"position_x",0.25f);
+    for (int i = 0; i < 100; ++i) processor.processBlock(buffer,midi);
+    check(processor.displayedPlaneTransform().positionX>0.24f,"geometry automation waited for a GUI timer");
 }
 }
 
@@ -61,8 +360,8 @@ int main()
     juce::Timer::callPendingTimersSynchronously();
     const auto imageOnlyScope = editor->createComponentSnapshot(editor->getLocalBounds(), true, 1.0f);
     bool unchangedSilentPolar = true;
-    for (int y = 85; y < 500; ++y)
-        for (int x = 545; x < 1020; ++x)
+    for (int y = 85; y < 470; ++y)
+        for (int x = editor->getWidth()/2+14; x < editor->getWidth()-20; ++x)
             unchangedSilentPolar = unchangedSilentPolar
                 && emptyScope.getPixelAt(x,y) == imageOnlyScope.getPixelAt(x,y);
     check(unchangedSilentPolar, "loading an image changed the silent polar view");
@@ -75,8 +374,10 @@ int main()
     const auto restoredMask = restored.imageMask();
     check(mask != nullptr && restoredMask != nullptr && mask->values == restoredMask->values,
           "native state round-trip changed image map");
-    check(mask != nullptr && restoredMask != nullptr && mask->fieldAngles == restoredMask->fieldAngles,
-          "native state round-trip changed projected steering field");
+    check(mask != nullptr && restoredMask != nullptr
+        && std::equal(mask->nearestSupport.begin(),mask->nearestSupport.end(),restoredMask->nearestSupport.begin(),
+            [](auto a,auto b) { return std::abs(a.x-b.x)<1.0e-6f && std::abs(a.y-b.y)<1.0e-6f; }),
+          "native state round-trip changed image-coordinate support");
     check(restored.state().getParameter("image_target") == nullptr, "obsolete mode parameter still exposed");
     check(std::abs(restored.state().getRawParameterValue("image_threshold")->load() - 0.6f) < 1.0e-6f,
           "threshold did not restore");
@@ -110,18 +411,10 @@ int main()
     set(processor, "image_projection", 0.0f);
     const auto beforeMove = processor.imageMask();
     set(processor, "position_x", 0.25f);
-    for (int i = 0; i < 300 && processor.imageMask() == beforeMove; ++i) {
-        juce::Thread::sleep(10);
-        juce::Timer::callPendingTimersSynchronously();
-    }
+    juce::Timer::callPendingTimersSynchronously();
     const auto moved = processor.imageMask();
-    check(moved != nullptr && beforeMove != nullptr && moved->fieldAngles != beforeMove->fieldAngles,
-          "geometry-only gesture did not rebuild steering field");
+    check(moved == beforeMove,"geometry unnecessarily rebuilt a pose-independent image field");
     set(processor, "position_x", 0.0f);
-    for (int i = 0; i < 300 && processor.imageMask() == moved; ++i) {
-        juce::Thread::sleep(10);
-        juce::Timer::callPendingTimersSynchronously();
-    }
 
     processor.prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> buffer(2, 512);
@@ -194,5 +487,7 @@ int main()
     check(output.setPosition(0) && output.truncate().wasOk(), "diagnostic snapshot reset failed");
     juce::PNGImageFormat png;
     check(png.writeImageToStream(snapshot, output), "editor snapshot failed");
+    textAndMotionTests();
+    letterARegression();
     return failures == 0 ? 0 : 1;
 }

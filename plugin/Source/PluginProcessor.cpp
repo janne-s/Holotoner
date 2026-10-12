@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "TextSource.h"
 
 #include <juce_audio_utils/juce_audio_utils.h>
 
@@ -10,12 +11,69 @@
 
 namespace {
 
-constexpr int kStateVersion = 7;
+constexpr int kStateVersion = 9;
 constexpr int kOldestReadableStateVersion = 2;
 constexpr juce::int64 kMaximumImageFileBytes = 32 * 1024 * 1024;
 constexpr int kMaximumImageDimension = 1024;
 static_assert(std::atomic<float>::is_always_lock_free);
 static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+
+float boundedValue(const std::atomic<float>* value,float fallback,float minimum,float maximum)
+{
+    const auto raw = value->load(std::memory_order_relaxed);
+    return std::clamp(std::isfinite(raw) ? raw : fallback,minimum,maximum);
+}
+
+juce::String parametersNameForAxis(const juce::String& key)
+{
+    if (key == "pitch") return "Rotation X";
+    if (key == "yaw") return "Rotation Y";
+    if (key == "roll") return "Rotation Z";
+    if (key == "position_x") return "Position X";
+    if (key == "position_y") return "Position Y";
+    return key == "scale_x" ? "Scale X" : "Scale Y";
+}
+
+// Control/loader threads only. One normalization path for imported, rendered and restored media.
+std::shared_ptr<const HolotonerProcessor::ImageDocument> makeDocument(juce::Image decoded, juce::String name,
+                                                                  const juce::MemoryBlock* embeddedPng = nullptr)
+{
+    if (decoded.isNull()) return {};
+    const auto largest = std::max(decoded.getWidth(), decoded.getHeight());
+    if (largest > kMaximumImageDimension) {
+        embeddedPng = nullptr;
+        const auto scale = static_cast<double>(kMaximumImageDimension)/largest;
+        decoded = decoded.rescaled(std::max(1, juce::roundToInt(scale*decoded.getWidth())),
+            std::max(1, juce::roundToInt(scale*decoded.getHeight())), juce::Graphics::highResamplingQuality);
+    }
+    decoded = decoded.convertedToFormat(juce::Image::ARGB);
+    auto document = std::make_shared<HolotonerProcessor::ImageDocument>();
+    if (embeddedPng != nullptr) document->normalizedPng = *embeddedPng;
+    else {
+        juce::MemoryOutputStream encoded(document->normalizedPng, false);
+        juce::PNGImageFormat png;
+        if (!png.writeImageToStream(decoded, encoded)) return {};
+    }
+    // Analyze exactly the serialized bitmap, not a pre-encode premultiplied surface.
+    // Restoring retains these bytes, avoiding repeated alpha rounding in colour emoji.
+    decoded = juce::ImageFileFormat::loadFrom(document->normalizedPng.getData(),document->normalizedPng.getSize());
+    if (decoded.isNull()) return {};
+    document->image = decoded;
+    document->name = std::move(name);
+    auto& rgba = document->rgba;
+    rgba.width = decoded.getWidth();
+    rgba.height = decoded.getHeight();
+    rgba.pixels.resize(static_cast<std::size_t>(rgba.width*rgba.height)*4);
+    const juce::Image::BitmapData pixels(decoded, juce::Image::BitmapData::readOnly);
+    for (int y = 0; y < rgba.height; ++y)
+        for (int x = 0; x < rgba.width; ++x) {
+            const auto colour = pixels.getPixelColour(x,y);
+            const auto at = static_cast<std::size_t>((y*rgba.width+x)*4);
+            rgba.pixels[at] = colour.getRed(); rgba.pixels[at+1] = colour.getGreen();
+            rgba.pixels[at+2] = colour.getBlue(); rgba.pixels[at+3] = colour.getAlpha();
+        }
+    return document;
+}
 
 juce::String sourceKindKey(holotoner::SourceKind kind)
 {
@@ -91,6 +149,18 @@ HolotonerProcessor::HolotonerProcessor()
     imageProjection_ = parameters_.getRawParameterValue("image_projection");
     imageThreshold_ = parameters_.getRawParameterValue("image_threshold");
     imageBinary_ = parameters_.getRawParameterValue("image_binary");
+    motionShape_ = parameters_.getRawParameterValue("motion_shape");
+    motionDepth_ = parameters_.getRawParameterValue("motion_depth");
+    for (std::size_t i = 0; i < kMotionAxes.size(); ++i) {
+        axisRate_[i] = parameters_.getRawParameterValue(juce::String(kMotionAxes[i])+"_rate");
+        axisSync_[i] = parameters_.getRawParameterValue(juce::String(kMotionAxes[i])+"_rate_sync");
+    }
+    textLayout_ = parameters_.getRawParameterValue("text_layout");
+    textPlay_ = parameters_.getRawParameterValue("text_play");
+    textFrame_ = parameters_.getRawParameterValue("text_frame");
+    textRate_ = parameters_.getRawParameterValue("text_rate");
+    textSync_ = parameters_.getRawParameterValue("text_rate_sync");
+    localBpm_ = parameters_.getRawParameterValue("tempo");
     jassert(positionX_ != nullptr && positionY_ != nullptr && scaleX_ != nullptr && scaleY_ != nullptr
             && pitch_ != nullptr && yaw_ != nullptr && roll_ != nullptr && wet_ != nullptr
             && imageChannel_ != nullptr && imageGain_ != nullptr
@@ -122,13 +192,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::paramete
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID {"scale_y", 1}, "Scale Y", juce::NormalisableRange<float> {0.05f, 4.0f, 0.001f}, 1.0f));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID {"pitch", 1}, "Pitch", degrees, 0.0f,
+        juce::ParameterID {"pitch", 1}, "Rotation X", degrees, 0.0f,
         juce::AudioParameterFloatAttributes().withLabel("deg")));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID {"yaw", 1}, "Yaw", degrees, 0.0f,
+        juce::ParameterID {"yaw", 1}, "Rotation Y", degrees, 0.0f,
         juce::AudioParameterFloatAttributes().withLabel("deg")));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        juce::ParameterID {"roll", 1}, "Roll", degrees, 0.0f,
+        juce::ParameterID {"roll", 1}, "Rotation Z", degrees, 0.0f,
         juce::AudioParameterFloatAttributes().withLabel("deg")));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
         juce::ParameterID {"wet", 1}, "Wet", juce::NormalisableRange<float> {0.0f, 1.0f, 0.001f}, 1.0f,
@@ -168,11 +238,42 @@ juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::paramete
             .withLabel("%")
             .withStringFromValueFunction([](float value, int) { return juce::String(100.0f * value, 0); })
             .withValueFromStringFunction([](const juce::String& text) { return 0.01f * text.getFloatValue(); })));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID {"motion_shape", 1},
+        "Motion Shape", juce::StringArray {"Swing", "Spin"}, 0));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID {"motion_depth", 1},
+        "Motion Depth", juce::NormalisableRange<float> {0, 1, 0.001f}, 0.5f,
+        juce::AudioParameterFloatAttributes().withLabel("%")
+            .withStringFromValueFunction([](float value, int) { return juce::String(100.0f*value,0); })
+            .withValueFromStringFunction([](const juce::String& value) { return 0.01f*value.getFloatValue(); })));
+    layout.add(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID {"text_layout", 1},
+        "Text Layout", juce::StringArray {"Whole", "Characters", "Words"}, 0));
+    layout.add(std::make_unique<juce::AudioParameterBool>(juce::ParameterID {"text_play", 1}, "Text Play", false));
+    layout.add(std::make_unique<juce::AudioParameterInt>(juce::ParameterID {"text_frame", 1}, "Text Frame", 1, 32, 1));
+    layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID {"tempo", 1}, "Tempo",
+        juce::NormalisableRange<float> {20, 300, 0.1f}, 120,
+        juce::AudioParameterFloatAttributes().withLabel("BPM")));
+    juce::StringArray notes;
+    for (const auto* name : holotoner::kSyncNames) notes.add(name);
+    juce::StringArray rateKeys {"text"};
+    for (const auto* key : kMotionAxes) rateKeys.add(key);
+    for (const auto& key : rateKeys) {
+        const auto title = key == "text" ? juce::String("Text") : parametersNameForAxis(key);
+        layout.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID {key+"_rate", 1},
+            title+" Rate", juce::NormalisableRange<float> {0, 8, 0.001f, 0.4f}, key == "text" ? 0.25f : 0.0f,
+            juce::AudioParameterFloatAttributes().withLabel("Hz")));
+        layout.add(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID {key+"_rate_sync", 1},
+            juce::String(title)+" Note", notes, 0));
+    }
     return layout;
 }
 
 void HolotonerProcessor::prepareToPlay(double sampleRate, int)
 {
+    clockSampleRate_ = std::isfinite(sampleRate) && sampleRate>0 ? sampleRate : 48000;
+    for (auto& clock : axisClocks_) clock.reset();
+    textClock_.reset();
+    motionSamples_ = 0;
+    hasDisplayedPlane_.store(false);
     holotoner::ImageSpatializer::Parameters spatialParameters;
     spatialParameters.plane = planeTransform();
     spatialParameters.phaseProjection = imageProjection_->load(std::memory_order_relaxed) >= 0.5f
@@ -221,18 +322,33 @@ void HolotonerProcessor::processBlock(juce::AudioBuffer<float>& audio, juce::Mid
 
     bool hostKnowsTransport = false;
     bool hostPlaying = false;
-    if (auto* playHead = getPlayHead())
+    double bpm = boundedValue(localBpm_,120,20,300);
+    double ppq = textClock_.beats;
+    bool hostHasPpq = false;
+    if (auto* playHead = wrapperType != wrapperType_Standalone ? getPlayHead() : nullptr)
         if (const auto position = playHead->getPosition()) {
             hostKnowsTransport = true;
             hostPlaying = position->getIsPlaying();
+            if (const auto tempo = position->getBpm(); tempo && std::isfinite(*tempo) && *tempo > 0)
+                bpm = std::clamp(*tempo, 1.0, 1000.0);
+            if (const auto beat = position->getPpqPosition(); beat && std::isfinite(*beat) && std::abs(*beat) < 1.0e12) {
+                ppq = *beat;
+                hostHasPpq = true;
+            }
         }
     const bool hostStopped = wrapperType != wrapperType_Standalone && hostKnowsTransport && !hostPlaying;
     waitingForHost_.store(hostStopped, std::memory_order_relaxed);
     const auto kind = sourceKind();
-    if (restartRequested_.exchange(false) || kind != playedSourceKind_)
+    if (restartRequested_.exchange(false) || kind != playedSourceKind_) {
         sourcePlayer_.restart();
+        for (auto& clock : axisClocks_) clock.reset();
+        textClock_.reset();
+        if (!hostHasPpq) ppq = 0;
+    }
     playedSourceKind_ = kind;
-    if (kind == holotoner::SourceKind::Input || (sourcePlaying_.load() && !hostStopped)) {
+    const bool localPlaying = wrapperType != wrapperType_Standalone || sourcePlaying_.load();
+    if ((kind == holotoner::SourceKind::Input && localPlaying)
+        || (kind != holotoner::SourceKind::Input && sourcePlaying_.load() && !hostStopped)) {
         sourcePlayer_.render(kind, sources_.acquire(), audio.getWritePointer(0), audio.getWritePointer(1), samples);
     } else {
         audio.clear(0, 0, samples);
@@ -247,20 +363,66 @@ void HolotonerProcessor::processBlock(juce::AudioBuffer<float>& audio, juce::Mid
     inputRight_.store(meterInputRight_, std::memory_order_relaxed);
 
     holotoner::ImageSpatializer::Parameters spatialParameters;
-    spatialParameters.plane = planeTransform();
     spatialParameters.phaseProjection = imageProjection_->load(std::memory_order_relaxed) >= 0.5f
         ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
     spatialParameters.imageAmount = imageAmount_->load(std::memory_order_relaxed);
     spatialParameters.wet = wet_->load(std::memory_order_relaxed);
-    engine_.setParameters(spatialParameters);
-    const auto* mask = masks_.acquire();
-    masks_.hold(0, mask);
+    const auto* bank = banks_.acquire();
+    banks_.hold(0, bank);
     for (int i = 0; i < samples; ++i) {
         const std::array<float, 2> pair {audio.getReadPointer(0)[i], audio.getReadPointer(1)[i]};
         scopeInput_[(scopeWritten_ + static_cast<std::uint64_t>(i)) % kScopeHistory]
             .store(std::bit_cast<std::uint64_t>(pair), std::memory_order_relaxed);
     }
-    engine_.process(audio.getWritePointer(0), audio.getWritePointer(1), samples, mask);
+    const bool clockPlaying = !hostStopped && localPlaying;
+    const auto textDivision = juce::roundToInt(boundedValue(textSync_,0,0,23));
+    const auto textHz = boundedValue(textRate_,0.25f,0,8);
+    const auto depth = boundedValue(motionDepth_,0.5f,0,1);
+    for (int offset = 0; offset < samples;) {
+        // Fixed audio-sample grid, independent of the host's block partition and UI rate.
+        const auto count = std::min(samples-offset, 32-static_cast<int>(motionSamples_ % 32));
+        const auto partial = clockPlaying ? static_cast<double>(motionSamples_ % 32) : 0.0;
+        const auto beat = hostHasPpq ? ppq + (clockPlaying ? (offset-partial)*bpm/(60.0*clockSampleRate_) : 0.0)
+                                    : textClock_.beats-partial*bpm/(60.0*clockSampleRate_);
+        const auto textCycles = textClock_.cycles(textDivision, beat)
+            - (textDivision == 0 ? partial*textHz/clockSampleRate_ : 0.0);
+        const holotoner::ImageMask* mask = nullptr;
+        spatialParameters.plane = planeTransform();
+        for (std::size_t axis = 0; axis < axisClocks_.size(); ++axis) {
+            const auto hz = boundedValue(axisRate_[axis],0,0,8);
+            const auto division = juce::roundToInt(boundedValue(axisSync_[axis],0,0,23));
+            if (hz > 0 || division > 0) {
+                const auto cycles = axisClocks_[axis].cycles(division,beat)
+                    - (division == 0 ? partial*hz/clockSampleRate_ : 0.0);
+                spatialParameters.plane = holotoner::motionPlane(spatialParameters.plane,
+                    {static_cast<int>(axis)+1,motionShape_->load()>=0.5f,depth},cycles);
+            }
+            axisClocks_[axis].advance(count,clockSampleRate_,hz,bpm,clockPlaying);
+        }
+        if (bank != nullptr && !bank->frames.empty()) {
+            const auto frameCount = static_cast<int>(bank->frames.size());
+            int frame = juce::jlimit(0, frameCount-1, juce::roundToInt(boundedValue(textFrame_,1,1,32))-1);
+            if (textPlay_->load() >= 0.5f) {
+                const auto integral = std::abs(textCycles-std::round(textCycles)) < 1.0e-9
+                    ? std::round(textCycles) : std::floor(textCycles);
+                const auto wrapped = std::fmod(integral, static_cast<double>(frameCount));
+                frame = static_cast<int>(wrapped < 0 ? wrapped+frameCount : wrapped);
+            }
+            displayedTextFrame_.store(frame, std::memory_order_relaxed);
+            const auto& selected = bank->frames[static_cast<std::size_t>(frame)];
+            mask = selected.mask.get();
+        }
+        engine_.setParameters(spatialParameters);
+        engine_.process(audio.getWritePointer(0)+offset, audio.getWritePointer(1)+offset, count, mask);
+        const auto p = engine_.currentPlane();
+        const std::array<float, 7> visible {p.positionX,p.positionY,p.scaleX,p.scaleY,
+            p.pitchDegrees,p.yawDegrees,p.rollDegrees};
+        for (std::size_t i = 0; i < visible.size(); ++i) displayedPlane_[i].store(visible[i], std::memory_order_relaxed);
+        hasDisplayedPlane_.store(true, std::memory_order_release);
+        textClock_.advance(count, clockSampleRate_, textHz, bpm, clockPlaying);
+        motionSamples_ += static_cast<std::uint64_t>(count);
+        offset += count;
+    }
     for (int i = 0; i < samples; ++i) {
         const std::array<float, 2> pair {audio.getReadPointer(0)[i], audio.getReadPointer(1)[i]};
         scopeOutput_[scopeWritten_++ % kScopeHistory]
@@ -282,6 +444,13 @@ holotoner::PlaneTransform HolotonerProcessor::planeTransform() const
             scaleX_->load(std::memory_order_relaxed), scaleY_->load(std::memory_order_relaxed),
             pitch_->load(std::memory_order_relaxed), yaw_->load(std::memory_order_relaxed),
             roll_->load(std::memory_order_relaxed)};
+}
+
+holotoner::PlaneTransform HolotonerProcessor::displayedPlaneTransform() const
+{
+    if (!hasDisplayedPlane_.load(std::memory_order_acquire)) return planeTransform();
+    return {displayedPlane_[0].load(),displayedPlane_[1].load(),displayedPlane_[2].load(),
+        displayedPlane_[3].load(),displayedPlane_[4].load(),displayedPlane_[5].load(),displayedPlane_[6].load()};
 }
 
 HolotonerProcessor::MeterState HolotonerProcessor::meterState() const
@@ -323,7 +492,20 @@ void HolotonerProcessor::getStateInformation(juce::MemoryBlock& destination)
             std::lock_guard lock(sourceInfoMutex_);
             source->setAttribute("path", sourceFile_.getFullPathName());
         }
-        if (const auto image = imageDocument()) {
+        std::lock_guard imageLock(imageMutex_);
+        if (pendingMediaState_ != nullptr) {
+            xml->addChildElement(new juce::XmlElement(*pendingMediaState_));
+        } else if (text_.isNotEmpty() && !textFrames_.empty()) {
+            auto* textState = xml->createNewChildElement("Text");
+            textState->setAttribute("value", text_);
+            textState->setAttribute("layout", renderedTextLayout_);
+            textState->setAttribute("renderer_version",2);
+            for (const auto& document : textFrames_) {
+                auto* frame = textState->createNewChildElement("Frame");
+                frame->setAttribute("name", document->name);
+                frame->addTextElement(document->normalizedPng.toBase64Encoding());
+            }
+        } else if (const auto image = image_) {
             auto* imageState = xml->createNewChildElement("Image");
             imageState->setAttribute("name", image->name);
             imageState->addTextElement(image->normalizedPng.toBase64Encoding());
@@ -334,6 +516,7 @@ void HolotonerProcessor::getStateInformation(juce::MemoryBlock& destination)
 
 void HolotonerProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
+    if (data == nullptr || sizeInBytes <= 0 || sizeInBytes > 64*1024*1024) return;
     const auto xml = getXmlFromBinary(data, sizeInBytes);
     if (xml == nullptr || !xml->hasTagName(parameters_.state.getType()))
         return;
@@ -341,14 +524,37 @@ void HolotonerProcessor::setStateInformation(const void* data, int sizeInBytes)
     juce::File sourceFileToRestore;
     juce::MemoryBlock imageToRestore;
     juce::String imageNameToRestore;
+    juce::String textToRestore;
+    int textLayoutToRestore = 0;
+    bool fitTextToRestore = false;
+    std::vector<std::pair<juce::String, juce::MemoryBlock>> framesToRestore;
+    std::unique_ptr<juce::XmlElement> mediaStateToRestore;
+    if (auto* textState = xml->getChildByName("Text")) {
+        textToRestore = textState->getStringAttribute("value");
+        textLayoutToRestore = textState->getIntAttribute("layout");
+        fitTextToRestore = textState->getIntAttribute("renderer_version",1)<2;
+        if (textToRestore.length() > 256 || textLayoutToRestore < 0 || textLayoutToRestore > 2
+            || textState->getNumChildElements() > textSource::kMaximumFrames) return;
+        mediaStateToRestore = std::make_unique<juce::XmlElement>(*textState);
+        for (auto* frame : textState->getChildIterator()) {
+            juce::MemoryBlock bytes;
+            if (frame->hasTagName("Frame") && bytes.fromBase64Encoding(frame->getAllSubText())
+                && bytes.getSize() <= static_cast<std::size_t>(kMaximumImageFileBytes))
+                framesToRestore.emplace_back(frame->getStringAttribute("name"), std::move(bytes));
+            if (framesToRestore.size() >= textSource::kMaximumFrames) break;
+        }
+        xml->removeChildElement(textState, true);
+    }
     if (auto* source = xml->getChildByName("Source")) {
         sourceKindToRestore = sourceKindFromKey(source->getStringAttribute("kind"));
         sourceFileToRestore = juce::File(source->getStringAttribute("path"));
         xml->removeChildElement(source, true);
     }
     if (auto* image = xml->getChildByName("Image")) {
+        if (mediaStateToRestore == nullptr) mediaStateToRestore = std::make_unique<juce::XmlElement>(*image);
         imageNameToRestore = image->getStringAttribute("name");
         imageToRestore.fromBase64Encoding(image->getAllSubText());
+        if (imageToRestore.getSize() > static_cast<std::size_t>(kMaximumImageFileBytes)) return;
         xml->removeChildElement(image, true);
     }
     auto state = juce::ValueTree::fromXml(*xml);
@@ -371,6 +577,44 @@ void HolotonerProcessor::setStateInformation(const void* data, int sizeInBytes)
                     child.setProperty("value", 0.0f, nullptr);
             }
         state.setProperty("format_version", kStateVersion, nullptr);
+        if (version < 8) {
+            // A legacy state loaded into an already-running processor must not inherit new motion/text playback.
+            for (const auto* id : {"motion_shape", "motion_depth",
+                                  "text_layout", "text_play", "text_frame", "text_rate", "text_rate_sync", "tempo"}) {
+                auto child = juce::ValueTree("PARAM");
+                auto* parameter = parameters_.getParameter(id);
+                for (int i = state.getNumChildren()-1; i >= 0; --i)
+                    if (state.getChild(i).getProperty("id").toString() == id) state.removeChild(i, nullptr);
+                child.setProperty("id", id, nullptr);
+                child.setProperty("value", parameter->convertFrom0to1(parameter->getDefaultValue()), nullptr);
+                state.addChild(child, -1, nullptr);
+            }
+        }
+        if (version < 9) {
+            const auto value = [&state](const char* id,float fallback) {
+                for (int i = 0; i < state.getNumChildren(); ++i)
+                    if (state.getChild(i).getProperty("id").toString() == id)
+                        return static_cast<float>(state.getChild(i).getProperty("value",fallback));
+                return fallback;
+            };
+            const auto oldTarget = version >= 8 ? juce::roundToInt(value("motion_target",0)) : 0;
+            const auto oldRate = value("motion_rate",0.25f), oldSync = value("motion_rate_sync",0);
+            for (std::size_t axis = 0; axis < kMotionAxes.size(); ++axis)
+                for (const auto& suffix : {juce::String("_rate"),juce::String("_rate_sync")}) {
+                    const auto id = juce::String(kMotionAxes[axis])+suffix;
+                    for (int i = state.getNumChildren()-1; i >= 0; --i)
+                        if (state.getChild(i).getProperty("id").toString() == id) state.removeChild(i,nullptr);
+                    const bool selected = oldTarget == static_cast<int>(axis)+1 || (oldTarget == 6 && axis == 6);
+                    auto child = juce::ValueTree("PARAM");
+                    child.setProperty("id",id,nullptr);
+                    child.setProperty("value",selected ? (suffix == "_rate" ? oldRate : oldSync) : 0.0f,nullptr);
+                    state.addChild(child,-1,nullptr);
+                }
+        }
+        for (int i = state.getNumChildren()-1; i >= 0; --i) {
+            const auto id = state.getChild(i).getProperty("id").toString();
+            if (id == "motion_target" || id == "motion_rate" || id == "motion_rate_sync") state.removeChild(i,nullptr);
+        }
         parameters_.replaceState(state);
         const bool fileExists = sourceFileToRestore.existsAsFile();
         {
@@ -393,12 +637,42 @@ void HolotonerProcessor::setStateInformation(const void* data, int sizeInBytes)
         {
             std::lock_guard lock(imageMutex_);
             image_.reset();
+            text_.clear();
+            textFrames_.clear();
+            renderedTextLayout_ = -1;
+            rejectedTextLayout_ = -1;
+            pendingMediaState_ = std::move(mediaStateToRestore);
             imageMessage_.clear();
+            mediaVersion_.fetch_add(1);
         }
-        if (!imageToRestore.isEmpty()) {
+        if (!framesToRestore.empty() && textToRestore.isNotEmpty()) {
+            imageLoadsPending_.fetch_add(1);
+            mediaLoader_.addJob([this, frames = std::move(framesToRestore), value = std::move(textToRestore),
+                                  textLayoutToRestore, imageRequest,fitTextToRestore]() mutable {
+                std::vector<std::shared_ptr<const ImageDocument>> restored;
+                for (auto& [name, bytes] : frames) {
+                    if (imageRequest != imageRequest_.load()) break;
+                    auto decoded = juce::ImageFileFormat::loadFrom(bytes.getData(),bytes.getSize());
+                    if (fitTextToRestore && decoded.isValid()) decoded = textSource::fitInk(decoded);
+                    const auto document = makeDocument(decoded,name,fitTextToRestore ? nullptr : &bytes);
+                    if (document != nullptr) restored.push_back(document);
+                }
+                if (imageRequest == imageRequest_.load() && restored.size() == frames.size() && !restored.empty()) {
+                    std::lock_guard lock(imageMutex_);
+                    if (imageRequest != imageRequest_.load()) { imageLoadsPending_.fetch_sub(1); return; }
+                    text_ = std::move(value);
+                    renderedTextLayout_ = textLayoutToRestore;
+                    textFrames_ = std::move(restored);
+                    image_ = textFrames_.front();
+                    pendingMediaState_.reset();
+                    mediaVersion_.fetch_add(1);
+                } else if (imageRequest == imageRequest_.load()) setImageMessage("Cannot restore embedded text frames");
+                imageLoadsPending_.fetch_sub(1);
+            });
+        } else if (!imageToRestore.isEmpty()) {
             imageLoadsPending_.fetch_add(1);
             mediaLoader_.addJob([this, imageBytes = std::move(imageToRestore), name = std::move(imageNameToRestore), imageRequest]() mutable {
-                loadImageData(std::move(imageBytes), std::move(name), imageRequest);
+                loadImageData(std::move(imageBytes), std::move(name), imageRequest, true);
                 imageLoadsPending_.fetch_sub(1);
             });
         }
@@ -471,7 +745,16 @@ void HolotonerProcessor::setSourceMessage(const juce::String& message)
 void HolotonerProcessor::timerCallback()
 {
     sources_.collectGarbage();
-    masks_.collectGarbage();
+    banks_.collectGarbage();
+    juce::String value;
+    bool needsText = false;
+    const auto layout = juce::roundToInt(textLayout_->load());
+    {
+        std::lock_guard lock(imageMutex_);
+        needsText = text_.isNotEmpty() && renderedTextLayout_ != layout && rejectedTextLayout_ != layout;
+        value = text_;
+    }
+    if (needsText && imageLoadsPending_.load() == 0) setText(value);
     rebuildImageMaskIfNeeded();
 }
 
@@ -504,61 +787,87 @@ void HolotonerProcessor::loadImageFile(const juce::File& file)
     });
 }
 
-void HolotonerProcessor::loadImageData(juce::MemoryBlock data, juce::String name, std::uint64_t request)
+void HolotonerProcessor::loadImageData(juce::MemoryBlock data, juce::String name, std::uint64_t request, bool embedded)
 {
-    auto decoded = juce::ImageFileFormat::loadFrom(data.getData(), data.getSize());
-    if (decoded.isNull()) {
+    auto document = makeDocument(juce::ImageFileFormat::loadFrom(data.getData(), data.getSize()), name, embedded ? &data : nullptr);
+    if (document == nullptr) {
         if (request == imageRequest_.load())
             setImageMessage("Cannot decode image " + name);
         return;
     }
 
-    const auto largest = std::max(decoded.getWidth(), decoded.getHeight());
-    if (largest > kMaximumImageDimension) {
-        const auto scale = static_cast<double>(kMaximumImageDimension) / static_cast<double>(largest);
-        decoded = decoded.rescaled(std::max(1, juce::roundToInt(scale * decoded.getWidth())),
-                                   std::max(1, juce::roundToInt(scale * decoded.getHeight())),
-                                   juce::Graphics::highResamplingQuality);
-    }
-    decoded = decoded.convertedToFormat(juce::Image::ARGB);
-
-    holotoner::RgbaImage rgba;
-    rgba.width = decoded.getWidth();
-    rgba.height = decoded.getHeight();
-    rgba.pixels.resize(static_cast<std::size_t>(rgba.width) * static_cast<std::size_t>(rgba.height) * 4);
-    const juce::Image::BitmapData pixels(decoded, juce::Image::BitmapData::readOnly);
-    for (int y = 0; y < rgba.height; ++y)
-        for (int x = 0; x < rgba.width; ++x) {
-            const auto colour = pixels.getPixelColour(x, y);
-            const auto offset = static_cast<std::size_t>((y * rgba.width + x) * 4);
-            rgba.pixels[offset] = colour.getRed();
-            rgba.pixels[offset + 1] = colour.getGreen();
-            rgba.pixels[offset + 2] = colour.getBlue();
-            rgba.pixels[offset + 3] = colour.getAlpha();
-        }
-
-    auto document = std::make_shared<ImageDocument>();
-    document->image = decoded;
-    document->name = std::move(name);
-    document->rgba = std::move(rgba);
-    juce::MemoryOutputStream encoded(document->normalizedPng, false);
-    juce::PNGImageFormat png;
-    if (!png.writeImageToStream(decoded, encoded)) {
-        if (request == imageRequest_.load())
-            setImageMessage("Cannot normalize image " + document->name);
-        return;
-    }
     if (request != imageRequest_.load())
         return;
     {
         std::lock_guard lock(imageMutex_);
+        if (request != imageRequest_.load()) return;
         image_ = std::move(document);
+        text_.clear();
+        textFrames_.clear();
+        renderedTextLayout_ = -1;
+        rejectedTextLayout_ = -1;
+        pendingMediaState_.reset();
         imageMessage_.clear();
+        mediaVersion_.fetch_add(1);
     }
+}
+
+void HolotonerProcessor::setText(const juce::String& value)
+{
+    const auto request = imageRequest_.fetch_add(1) + 1;
+    const auto layout = juce::roundToInt(textLayout_->load());
+    imageLoadsPending_.fetch_add(1);
+    mediaLoader_.addJob([this, value, layout, request] {
+        renderText(value, layout, request);
+        imageLoadsPending_.fetch_sub(1);
+    });
+}
+
+void HolotonerProcessor::renderText(juce::String value, int layout, std::uint64_t request)
+{
+    juce::String error;
+    const auto pieces = textSource::segments(value, layout, error);
+    std::vector<std::shared_ptr<const ImageDocument>> documents;
+    for (const auto& piece : pieces) {
+        if (request != imageRequest_.load()) return;
+        auto document = makeDocument(textSource::render(piece), piece);
+        if (document == nullptr) { error = "Cannot render text"; break; }
+        documents.push_back(std::move(document));
+    }
+    if (request != imageRequest_.load()) return;
+    std::lock_guard lock(imageMutex_);
+    if (request != imageRequest_.load()) return;
+    if (error.isNotEmpty()) {
+        imageMessage_ = error;
+        // Remember the rejected layout so an error does not queue a retry every UI tick.
+        rejectedTextLayout_ = layout;
+        return;
+    }
+    text_ = std::move(value);
+    renderedTextLayout_ = layout;
+    rejectedTextLayout_ = -1;
+    textFrames_ = std::move(documents);
+    image_ = textFrames_.front();
+    pendingMediaState_.reset();
+    imageMessage_.clear();
+    mediaVersion_.fetch_add(1);
+}
+
+juce::String HolotonerProcessor::text() const
+{
+    std::lock_guard lock(imageMutex_);
+    return text_;
+}
+
+int HolotonerProcessor::textFrameCount() const
+{
+    const auto bank = banks_.currentShared();
+    return bank != nullptr ? static_cast<int>(bank->frames.size()) : 0;
 }
 
 void HolotonerProcessor::rebuildImageMaskIfNeeded()
 {
+    if (bankPending_.load() || imageLoadsPending_.load() > 0) return;
     holotoner::ImageMaskSettings settings;
     settings.channel = static_cast<holotoner::PixelChannel>(
         juce::jlimit(0, 5, juce::roundToInt(imageChannel_->load(std::memory_order_relaxed))));
@@ -569,20 +878,15 @@ void HolotonerProcessor::rebuildImageMaskIfNeeded()
     settings.amount = 1.0f;
     settings.threshold = imageThreshold_->load(std::memory_order_relaxed);
     settings.binary = imageBinary_->load(std::memory_order_relaxed) >= 0.5f;
-    settings.plane = planeTransform();
-    settings.projection = imageProjection_->load(std::memory_order_relaxed) >= 0.5f
-        ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
-    const auto& p = settings.plane;
-    const auto& old = builtMaskSettings_.plane;
-    const bool geometryChanged = settings.projection != builtMaskSettings_.projection
-        || std::abs(p.positionX-old.positionX) > 1.0e-6f
-        || std::abs(p.positionY-old.positionY) > 1.0e-6f
-        || std::abs(p.scaleX-old.scaleX) > 1.0e-6f
-        || std::abs(p.scaleY-old.scaleY) > 1.0e-6f
-        || std::abs(p.pitchDegrees-old.pitchDegrees) > 1.0e-6f
-        || std::abs(p.yawDegrees-old.yawDegrees) > 1.0e-6f
-        || std::abs(p.rollDegrees-old.rollDegrees) > 1.0e-6f;
-    const auto image = imageDocument();
+    std::vector<std::shared_ptr<const ImageDocument>> images;
+    std::uint64_t mediaVersion = 0, request = 0;
+    {
+        std::lock_guard lock(imageMutex_);
+        images = textFrames_;
+        if (images.empty() && image_ != nullptr) images.push_back(image_);
+        mediaVersion = mediaVersion_.load();
+        request = imageRequest_.load();
+    }
     const bool settingsChanged = !hasBuiltMaskSettings_
         || settings.channel != builtMaskSettings_.channel
         || std::abs(settings.gain - builtMaskSettings_.gain) > 1.0e-6f
@@ -591,21 +895,52 @@ void HolotonerProcessor::rebuildImageMaskIfNeeded()
         || settings.invert != builtMaskSettings_.invert
         || settings.binary != builtMaskSettings_.binary
         || std::abs(settings.threshold - builtMaskSettings_.threshold) > 1.0e-6f;
-    if (image == maskImage_ && !settingsChanged && !geometryChanged)
+    if (images == maskImages_ && !settingsChanged
+        && mediaVersion == bankVersion_.load())
         return;
-    auto mask = std::make_shared<holotoner::ImageMask>();
-    if (image != nullptr)
-        *mask = holotoner::buildImageMask(image->rgba, settings);
-    masks_.publish(std::move(mask));
-    maskImage_ = image;
+    maskImages_ = images;
     builtMaskSettings_ = settings;
     hasBuiltMaskSettings_ = true;
+    bankPending_.store(true);
+    mediaLoader_.addJob([this, documents = std::move(images), settings, request, mediaVersion] {
+        auto bank = std::make_shared<ImageBank>();
+        for (const auto& image : documents) {
+            if (request != imageRequest_.load()) break;
+            ImageFrame frame;
+            frame.document = image;
+            auto mask = std::make_shared<holotoner::ImageMask>(holotoner::buildImageMask(image->rgba, settings));
+            frame.mask = mask;
+            bank->frames.push_back(std::move(frame));
+        }
+        if (request == imageRequest_.load() && mediaVersion == mediaVersion_.load()) {
+            banks_.publish(std::move(bank));
+            bankVersion_.store(mediaVersion);
+        }
+        else {
+            // Force the next control tick to compile the replacement, even if its settings match.
+            hasBuiltMaskSettings_ = false;
+        }
+        bankPending_.store(false, std::memory_order_release);
+    });
 }
 
 std::shared_ptr<const HolotonerProcessor::ImageDocument> HolotonerProcessor::imageDocument() const
 {
+    const auto bank = banks_.currentShared();
+    if (bank != nullptr && !bank->frames.empty()) {
+        const auto at = juce::jlimit(0, static_cast<int>(bank->frames.size())-1, displayedTextFrame_.load());
+        return bank->frames[static_cast<std::size_t>(at)].document;
+    }
     std::lock_guard lock(imageMutex_);
     return image_;
+}
+
+std::shared_ptr<const holotoner::ImageMask> HolotonerProcessor::imageMask() const
+{
+    const auto bank = banks_.currentShared();
+    if (bank == nullptr || bank->frames.empty()) return {};
+    const auto at = juce::jlimit(0, static_cast<int>(bank->frames.size())-1, displayedTextFrame_.load());
+    return bank->frames[static_cast<std::size_t>(at)].mask;
 }
 
 juce::String HolotonerProcessor::lastImageMessage() const

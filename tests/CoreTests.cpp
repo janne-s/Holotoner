@@ -3,6 +3,7 @@
 #include "core/dsp/ImageSpatializer.h"
 #include "core/dsp/StereoWidth.h"
 #include "core/geometry/PlaneProjection.h"
+#include "core/geometry/Motion.h"
 #include "core/image/ImageMask.h"
 
 #include <algorithm>
@@ -456,8 +457,6 @@ void phaseImageProcessing(double sampleRate)
     holotoner::ImageSpatializer::Parameters parameters;
     parameters.imageAmount = 1.0f;
     parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
-    holotoner::buildImageField(mask, parameters.plane, parameters.phaseProjection);
-    holotoner::buildImageField(other, parameters.plane, parameters.phaseProjection);
     for (auto* engine : {&whole, &split, &mirrored}) {
         engine->setParameters(parameters);
         engine->prepare(sampleRate);
@@ -492,7 +491,6 @@ void phaseImageProcessing(double sampleRate)
         ++failures;
     }
     parameters.plane.yawDegrees = 180.0f;
-    holotoner::buildImageField(mask, parameters.plane, parameters.phaseProjection);
     mirrored.setParameters(parameters);
     mirrored.prepare(sampleRate);
     otherL = otherR = input;
@@ -503,12 +501,19 @@ void phaseImageProcessing(double sampleRate)
     }
     parameters.plane.yawDegrees = 90.0f;
     auto edgeMask = mask;
-    holotoner::buildImageField(edgeMask, parameters.plane, parameters.phaseProjection);
     whole.setParameters(parameters);
     wholeL = wholeR = input;
     whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &edgeMask);
     for (std::size_t i = count - 512; i < count; ++i)
         expectNear(wholeL[i], wholeR[i], 2.0e-5f, "phase edge-on is mono");
+    parameters.plane.pitchDegrees = 65;
+    parameters.plane.rollDegrees = 37;
+    parameters.plane.scaleX = parameters.plane.scaleY = 4;
+    whole.setParameters(parameters);
+    wholeL = wholeR = input;
+    whole.process(wholeL.data(),wholeR.data(),static_cast<int>(count),&edgeMask);
+    for (std::size_t i = count-512; i < count; ++i)
+        expectNear(wholeL[i],wholeR[i],2.0e-5f,"combined rotations preserve edge-on mono");
     std::fill(wholeL.begin(), wholeL.end(), 0.0f);
     std::fill(wholeR.begin(), wholeR.end(), 0.0f);
     whole.process(wholeL.data(), wholeR.data(), static_cast<int>(count), &edgeMask);
@@ -588,13 +593,8 @@ void imageFieldMeasuredSupport(double sampleRate)
     auto mask = phaseFixture(false);
     holotoner::ImageSpatializer::Parameters parameters;
     parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
-    holotoner::buildImageField(mask, parameters.plane, parameters.phaseProjection);
     auto referenceMask = mask;
-    for (int row = 0; row < holotoner::ImageMask::kFieldRows; ++row)
-        for (int column = 0; column < holotoner::ImageMask::kFieldAngles; ++column)
-            referenceMask.fieldAngles[static_cast<std::size_t>(row*holotoner::ImageMask::kFieldAngles+column)]
-                = static_cast<float>(-0.5*3.141592653589793 + 3.141592653589793
-                    *column/(holotoner::ImageMask::kFieldAngles-1));
+    referenceMask.hasNearestSupport = false;
     constexpr std::size_t count = 131072;
     std::vector<float> left(count), right(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -648,6 +648,25 @@ void imageFieldMeasuredSupport(double sampleRate)
 
 int main()
 {
+    {
+        using namespace holotoner;
+        expectNear(static_cast<float>(kSyncBeats[15]), 1.0f, 0.0f, "quarter note is one PPQ beat");
+        expectNear(static_cast<float>(kSyncBeats[20]), 4.0f, 0.0f, "whole note is four PPQ beats");
+        CycleClock whole, split;
+        whole.advance(48000,48000,0.25,120,true);
+        for (int i = 0; i < 48000; ++i) split.advance(1,48000,0.25,120,true);
+        expectNear(static_cast<float>(whole.freeCycles),static_cast<float>(split.freeCycles),1.0e-6f,"free clock partition");
+        expectNear(static_cast<float>(whole.beats),static_cast<float>(split.beats),1.0e-6f,"beat clock partition");
+        whole.advance(48000,48000,8,200,false);
+        expectNear(static_cast<float>(whole.freeCycles),0.25f,0.0f,"pause holds free phase");
+        expectNear(static_cast<float>(whole.cycles(15,-0.25)), -0.25f,0.0f,"negative PPQ preserved");
+        auto base = PlaneTransform {};
+        base.rollDegrees = 170;
+        const auto spun = motionPlane(base,{3,true,0.5f},0.1);
+        expectNear(spun.rollDegrees,-154,1.0e-5f,"spin wraps instead of reversing at seam");
+        expectNear(base.rollDegrees,170,0,"motion never overwrites base geometry");
+        expectNear(motionPlane(base,{4,false,0.4f},0.25).positionX,0.4f,1.0e-6f,"position swing");
+    }
     projectionEndpoints();
     stereoEndpoints(44100.0);
     stereoEndpoints(48000.0);

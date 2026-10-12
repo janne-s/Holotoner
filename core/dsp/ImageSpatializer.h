@@ -36,6 +36,7 @@ public:
     void process(float* left, float* right, int sampleCount, const ImageMask* mask);
 
     int latencySamples() const { return static_cast<int>(kFftSize - 1); }
+    PlaneTransform currentPlane() const { return smoothedParameters_.plane; } // audio thread only
     std::uint32_t takeSafetyResets();
 
 private:
@@ -68,8 +69,12 @@ private:
     std::array<PhaseControls, kPhaseAnchors> phaseControls_ {};
     bool phaseInitialized_ = false;
     double fieldTime_ = 0.0;
-    std::array<float, ImageMask::kFieldRows * ImageMask::kFieldAngles> steering_ {}, previousSteering_ {};
-    float steeringBlend_ = 1.0f;
+    float geometryBlend_ = 1.0f;
+    std::array<ImageMask::PhasePoint,kImageMaskWidth*kImageMaskHeight> nearest_ {},previousNearest_ {};
+    std::array<float,kImageMaskWidth*kImageMaskHeight> supportValues_ {};
+    bool fieldHasSupport_ = false;
+    float fieldAspectX_ = 1,fieldAspectY_ = 1;
+    ProjectedPlane imagePlane_,previousImagePlane_;
     void constrainField(double& left, double& right);
     void buildPhaseControls(const ProjectedPlane&);
     void applyPhase(std::size_t bin, std::complex<double> left, std::complex<double> right,
