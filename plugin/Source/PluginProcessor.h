@@ -107,7 +107,6 @@ private:
     std::atomic<float>* roll_ = nullptr;
     std::atomic<float>* wet_ = nullptr;
     std::atomic<float>* imageChannel_ = nullptr;
-    std::atomic<float>* imageTarget_ = nullptr;
     std::atomic<float>* imageGain_ = nullptr;
     std::atomic<float>* imageFill_ = nullptr;
     std::atomic<float>* imageNormalize_ = nullptr;

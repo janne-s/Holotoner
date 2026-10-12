@@ -23,8 +23,8 @@ Builds never install plug-ins into your DAW directories automatically.
 
 1. Load an audio file with **Audio...** and an image with **Image...**.
    Test clicks are available, but sustained audio reveals the image better.
-2. Select **Phase map** and **XY rectangle**, with Amount and Wet at 100%.
-   An older saved session may still select Spectral place or Spectral level.
+2. Select **XY rectangle**, with Amount and Wet at 100%. Phase map is the
+   only processing engine; there is no mode selector.
 3. Begin with Gain 1 and Fill 0. Use Luma, Normalize, Threshold and optionally
    B/W to isolate a recognizable shape. The left panel shows the exact
    processed 64 × 64 mask, not the unprocessed colour photograph.
@@ -67,21 +67,24 @@ support, and during transitions. No fake points are added to measured output.
 The analyser folds negative sample polarity into the upper semicircle.
 Direction follows the L/R relationship; radius follows sample level on a
 −60..0 dB scale. Its labelled +14 dB display gain applies equally to measured
-input and output; it does not increase audio gain. Grey is the target/input;
-pink is measured output. Source level changes the figure's radial reach.
+input and output; it does not increase audio gain. Grey is measured input;
+pink is measured output. No target image, mask dots or shadow picture are drawn
+in the polar view. The processed image preview exists only on the left.
+Source level changes the figure's radial reach.
 The correlation bar is measured from output audio.
 
-**Spectral place** and **Spectral level** remain explicit alternatives.
-They map the image's vertical axis to logarithmic frequency, using a
-2048-sample FFT with four-times overlap. These alternatives do not reconstruct
-the full image. **Off** disables image processing while retaining plane geometry.
-All paths, including Dry, use the same 2047-sample latency.
+The engine uses a 2048-sample FFT with four-times overlap and 2047 samples of
+latency. Dry is delayed by the same amount. Amount 0 or Channel Off disables
+image influence while retaining plane geometry; Wet 0 restores aligned Dry.
+The retired Spectral place/level algorithms and mode parameter are removed,
+not hidden behind the simplified editor.
 
 Image import accepts PNG, JPEG and GIF off-thread. Images are normalized and
 embedded in versioned session state, so the original file is not required to
-reopen a session. State version 6 adds the projected image steering field.
-Versions 2–5 remain readable with their images and controls; old Phase map
-sessions use the corrected DSP, not the rejected scanner or fixed-only field.
+reopen a session. State version 7 removes the mode parameter. Versions 2–6
+remain readable with their images and other controls: old Phase/Place/Level
+sessions use the single phase-field engine; old mode Off becomes Amount 0.
+Old spectral sound is not retained as a dormant compatibility implementation.
 Media stays local.
 
 ## Repository and verification
@@ -120,15 +123,16 @@ cmake --build build/native-release --target holotoner-native-tests --parallel
 build/native-release/tests/holotoner-native-tests
 ```
 
-It checks embedded-image/parameter/field round-trips, geometry-only field
-rebuilds, file-source playback, actual
+It checks embedded-image/parameter/field round-trips, legacy mode migration,
+geometry-only field rebuilds, a pixel-identical silent polar view with/without
+an image, file-source playback, actual
 sample history, and renders a diagnostic editor image to
 `/tmp/holotoner-phase-editor.png`. Its media fixtures are original, temporary
 test data, not a bundled demo.
 
 Standalone, VST3 and AU build as universal arm64/x86_64 binaries. VST3 passes
 pluginval strictness 5. The native harness measured 60 seconds of Phase map,
-including sample history, in 0.68 seconds on 11 October 2026 (about 1.14% of
+including sample history, in 0.33 seconds (about 0.56% of
 one real-time stream's wall-clock budget). Timings are machine-specific, not
 a cross-device performance guarantee.
 

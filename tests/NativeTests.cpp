@@ -20,7 +20,8 @@ bool waitForMask(HolotonerProcessor& processor)
     for (int i = 0; i < 300; ++i) {
         juce::Thread::sleep(10);
         juce::Timer::callPendingTimersSynchronously();
-        if (const auto mask = processor.imageMask(); mask != nullptr && mask->hasSource)
+        if (const auto mask = processor.imageMask(); mask != nullptr && mask->hasSource
+            && !processor.isLoadingImage() && processor.imageDocument() != nullptr)
             return true;
     }
     return false;
@@ -32,12 +33,13 @@ int main()
     juce::ScopedJuceInitialiser_GUI gui;
     HolotonerProcessor processor;
     processor.setSourceKind(holotoner::SourceKind::Input);
-    set(processor, "image_target", 3.0f);
     set(processor, "image_amount", 1.0f);
     set(processor, "image_binary", 1.0f);
     set(processor, "image_threshold", 0.6f);
     set(processor, "scale_x", 0.8f);
     set(processor, "scale_y", 0.8f);
+    auto editor = std::unique_ptr<juce::AudioProcessorEditor>(processor.createEditor());
+    auto emptyScope = editor->createComponentSnapshot(editor->getLocalBounds(), true, 1.0f);
     juce::Image fixture(juce::Image::RGB, 128, 128, true);
     juce::Graphics drawing(fixture);
     drawing.setColour(juce::Colours::white);
@@ -55,6 +57,15 @@ int main()
     check(waitForMask(processor), "image/mask publication timed out");
     const auto mask = processor.imageMask();
     check(mask != nullptr && mask->hasPhasePoints, "native phase distribution missing");
+    juce::Thread::sleep(40);
+    juce::Timer::callPendingTimersSynchronously();
+    const auto imageOnlyScope = editor->createComponentSnapshot(editor->getLocalBounds(), true, 1.0f);
+    bool unchangedSilentPolar = true;
+    for (int y = 85; y < 500; ++y)
+        for (int x = 545; x < 1020; ++x)
+            unchangedSilentPolar = unchangedSilentPolar
+                && emptyScope.getPixelAt(x,y) == imageOnlyScope.getPixelAt(x,y);
+    check(unchangedSilentPolar, "loading an image changed the silent polar view");
 
     juce::MemoryBlock state;
     processor.getStateInformation(state);
@@ -66,10 +77,31 @@ int main()
           "native state round-trip changed image map");
     check(mask != nullptr && restoredMask != nullptr && mask->fieldAngles == restoredMask->fieldAngles,
           "native state round-trip changed projected steering field");
-    check(restored.state().getRawParameterValue("image_target")->load() == 3.0f,
-          "phase target did not restore");
+    check(restored.state().getParameter("image_target") == nullptr, "obsolete mode parameter still exposed");
     check(std::abs(restored.state().getRawParameterValue("image_threshold")->load() - 0.6f) < 1.0e-6f,
           "threshold did not restore");
+    // Legacy modes are metadata migration, not dormant DSP/host parameters.
+    auto legacy = juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize()));
+    legacy->setAttribute("format_version", 6);
+    auto* oldMode = legacy->createNewChildElement("PARAM");
+    oldMode->setAttribute("id", "image_target");
+    oldMode->setAttribute("value", 0.0);
+    juce::MemoryBlock legacyState;
+    juce::AudioProcessor::copyXmlToBinary(*legacy, legacyState);
+    restored.setStateInformation(legacyState.getData(), static_cast<int>(legacyState.getSize()));
+    check(waitForMask(restored), "legacy Off state image restore failed");
+    check(std::abs(restored.state().getRawParameterValue("image_amount")->load()) < 1.0e-6f,
+          "old Off mode did not migrate to Amount zero");
+    oldMode->setAttribute("value", 1.0);
+    juce::AudioProcessor::copyXmlToBinary(*legacy, legacyState);
+    restored.setStateInformation(legacyState.getData(), static_cast<int>(legacyState.getSize()));
+    check(waitForMask(restored), "legacy spectral state image restore failed");
+    check(std::abs(restored.state().getRawParameterValue("image_amount")->load()-1.0f) < 1.0e-6f,
+          "old spectral mode did not migrate to the single phase engine");
+    juce::MemoryBlock resaved;
+    restored.getStateInformation(resaved);
+    const auto cleanState = juce::AudioProcessor::getXmlFromBinary(resaved.getData(), static_cast<int>(resaved.getSize()));
+    check(!cleanState->toString().contains("image_target"), "retired mode persisted in new state");
     set(processor, "image_projection", 1.0f);
     processor.getStateInformation(state);
     restored.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
@@ -150,7 +182,8 @@ int main()
         filePeak = std::max(filePeak, buffer.getMagnitude(0, 512));
     }
     check(filePeak > 0.001f, "file source did not reach phase-map output");
-    auto editor = std::unique_ptr<juce::AudioProcessorEditor>(processor.createEditor());
+    // Refresh the left image preview only; polar must always use actual samples.
+    juce::Thread::sleep(40);
     juce::Timer::callPendingTimersSynchronously();
     const auto renderStarted = std::chrono::steady_clock::now();
     auto snapshot = editor->createComponentSnapshot(editor->getLocalBounds(), true, 1.0f);

@@ -391,89 +391,6 @@ void imageSpatializerEndpoints(double sampleRate)
     }
 }
 
-void imageSpatializerMakesMonoImageStereo()
-{
-    constexpr std::size_t count = 12288;
-    std::array<float, count> left {};
-    std::array<float, count> right {};
-    for (std::size_t i = 0; i < count; ++i)
-        left[i] = right[i] = static_cast<float>(0.2 * std::sin(static_cast<double>(i) * 0.21));
-
-    holotoner::ImageMask mask;
-    mask.hasSource = true;
-    for (int y = 0; y < holotoner::kImageMaskHeight; ++y)
-        for (int x = 0; x < holotoner::kImageMaskWidth; ++x)
-            mask.values[static_cast<std::size_t>(y * holotoner::kImageMaskWidth + x)]
-                = x >= 40 ? 1.0f : 0.0f;
-
-    holotoner::ImageSpatializer::Parameters parameters;
-    parameters.target = holotoner::ImageTarget::Place;
-    parameters.imageAmount = 1.0f;
-    parameters.wet = 1.0f;
-    holotoner::ImageSpatializer engine;
-    engine.setParameters(parameters);
-    engine.prepare(48000.0);
-    engine.process(left.data(), right.data(), static_cast<int>(count), &mask);
-    double differenceEnergy = 0.0;
-    for (std::size_t i = 2 * holotoner::ImageSpatializer::kFftSize; i < count; ++i) {
-        const auto difference = static_cast<double>(left[i] - right[i]);
-        differenceEnergy += difference * difference;
-    }
-    if (differenceEnergy < 1.0e-4) {
-        std::cerr << "image placement did not make mono input stereo\n";
-        ++failures;
-    }
-    const auto& analysis = engine.analysis();
-    float analysisPeak = 0.0f;
-    bool showsStereoField = false;
-    for (std::size_t i = 0; i < holotoner::ImageSpatializer::kAnalysisBins; ++i) {
-        analysisPeak = std::max(analysisPeak, analysis.level[i]);
-        showsStereoField = showsStereoField || (analysis.level[i] > 1.0e-4f
-            && (std::abs(analysis.balance[i]) > 0.01f || analysis.correlation[i] < 0.98f));
-        if (!std::isfinite(analysis.level[i]) || !std::isfinite(analysis.balance[i])
-            || !std::isfinite(analysis.correlation[i]) || analysis.level[i] < 0.0f
-            || std::abs(analysis.balance[i]) > 1.0f || std::abs(analysis.correlation[i]) > 1.0f) {
-            std::cerr << "polar analysis escaped finite bounds\n";
-            ++failures;
-            break;
-        }
-    }
-    if (analysis.revision == 0 || analysisPeak < 1.0e-4f) {
-        std::cerr << "polar analysis did not publish output energy\n";
-        ++failures;
-    }
-    if (!showsStereoField) {
-        std::cerr << "polar analysis did not expose the image stereo field\n";
-        ++failures;
-    }
-}
-
-void blackImageCanSilenceLevelTarget()
-{
-    constexpr std::size_t count = 12288;
-    std::array<float, count> left {};
-    std::array<float, count> right {};
-    for (std::size_t i = 0; i < count; ++i)
-        left[i] = right[i] = static_cast<float>(0.2 * std::sin(static_cast<double>(i) * 0.11));
-    holotoner::ImageMask black;
-    black.hasSource = true;
-    holotoner::ImageSpatializer::Parameters parameters;
-    parameters.target = holotoner::ImageTarget::Level;
-    parameters.imageAmount = 1.0f;
-    parameters.wet = 1.0f;
-    holotoner::ImageSpatializer engine;
-    engine.setParameters(parameters);
-    engine.prepare(48000.0);
-    engine.process(left.data(), right.data(), static_cast<int>(count), &black);
-    float endingPeak = 0.0f;
-    for (std::size_t i = count - holotoner::ImageSpatializer::kHopSize; i < count; ++i)
-        endingPeak = std::max({endingPeak, std::abs(left[i]), std::abs(right[i])});
-    if (endingPeak > 1.0e-4f) {
-        std::cerr << "black image level fade did not converge, peak " << endingPeak << '\n';
-        ++failures;
-    }
-}
-
 holotoner::ImageMask phaseFixture(bool mirror)
 {
     holotoner::RgbaImage image;
@@ -537,7 +454,6 @@ void phaseImageProcessing(double sampleRate)
     auto otherL = input, otherR = input;
     holotoner::ImageSpatializer whole, split, mirrored;
     holotoner::ImageSpatializer::Parameters parameters;
-    parameters.target = holotoner::ImageTarget::Phase;
     parameters.imageAmount = 1.0f;
     parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
     holotoner::buildImageField(mask, parameters.plane, parameters.phaseProjection);
@@ -746,8 +662,6 @@ int main()
     imageSpatializerEndpoints(44100.0);
     imageSpatializerEndpoints(48000.0);
     imageSpatializerEndpoints(96000.0);
-    imageSpatializerMakesMonoImageStereo();
-    blackImageCanSilenceLevelTarget();
     phaseMapCoordinatesAreActualAudio();
     phaseImageProcessing(44100.0);
     phaseImageProcessing(48000.0);

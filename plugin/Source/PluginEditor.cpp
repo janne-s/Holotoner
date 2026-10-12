@@ -138,10 +138,6 @@ public:
         graphics.setColour(style::text);
         graphics.setFont(juce::FontOptions(11.0f, juce::Font::bold));
         graphics.drawText("PROCESSED IMAGE", 12, 7, 150, 18, juce::Justification::centredLeft);
-        graphics.setColour(style::textDim);
-        graphics.setFont(juce::FontOptions(10.5f));
-        graphics.drawText("drag centre / white rotate / pink scale / top roll", 118, 7,
-                          getWidth() - 130, 18, juce::Justification::centredRight, true);
     }
 
     void mouseDown(const juce::MouseEvent& event) override
@@ -315,14 +311,6 @@ public:
         setInterceptsMouseClicks(false, false);
     }
 
-    void setMask(const holotoner::ImageMask* mask)
-    {
-        hasMask_ = mask != nullptr;
-        if (mask != nullptr)
-            mask_ = *mask;
-        repaint();
-    }
-
     void paint(juce::Graphics& graphics) override
     {
         const auto well = getLocalBounds().toFloat();
@@ -345,30 +333,6 @@ public:
         const auto toScreen = [origin, radius](holotoner::ScopePoint point) {
             return juce::Point<float> {origin.x + radius * point.x, origin.y - radius * point.y};
         };
-        const auto isPhase = processor_.state().getRawParameterValue("image_target")->load() >= 2.5f;
-        const auto projection = processor_.state().getRawParameterValue("image_projection")->load() >= 0.5f
-            ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
-        if (hasMask_ && isPhase) {
-            auto transform = mask_.fieldReady ? mask_.fieldPlane : processor_.planeTransform();
-            transform.scaleX *= mask_.aspectX;
-            transform.scaleY *= mask_.aspectY;
-            const auto plane = holotoner::projectPlane(transform);
-            for (int y = 0; y < holotoner::kImageMaskHeight; ++y)
-                for (int x = 0; x < holotoner::kImageMaskWidth; ++x) {
-                    const auto value = mask_.at(x, y);
-                    if (value <= 0.001f)
-                        continue;
-                    const auto point = holotoner::phaseMapPoint(plane,
-                        2.0f * static_cast<float>(x) / static_cast<float>(holotoner::kImageMaskWidth - 1) - 1.0f,
-                        1.0f - 2.0f * static_cast<float>(y) / static_cast<float>(holotoner::kImageMaskHeight - 1),
-                        projection);
-                    if (point.y < 0.0f || std::hypot(point.x, point.y) > 1.0f)
-                        continue;
-                    const auto screen = toScreen(point);
-                    graphics.setColour(style::textDim.withAlpha(0.22f * value));
-                    graphics.fillRect(juce::Rectangle<float>(2.0f, 2.0f).withCentre(screen));
-                }
-        }
         const auto count = processor_.scopeSamples(samples_.data(), static_cast<int>(samples_.size()));
         // A fixed, labelled +14 dB display gain, applied identically to both
         // measured input and output. This is NOT a fabricated image trace.
@@ -390,7 +354,7 @@ public:
         graphics.drawText("POLAR SAMPLE / +14 dB", 12, 7, 190, 18, juce::Justification::centredLeft);
         graphics.setColour(style::textDim);
         graphics.setFont(juce::FontOptions(10.5f));
-        graphics.drawText("target / input", getWidth() - 180, 7, 100, 18, juce::Justification::centredRight);
+        graphics.drawText("input", getWidth() - 180, 7, 100, 18, juce::Justification::centredRight);
         graphics.setColour(style::signal);
         graphics.drawText("output", getWidth() - 74, 7, 62, 18, juce::Justification::centredRight);
         const auto correlation = clamp(processor_.meterState().outputCorrelation, -1.0f, 1.0f);
@@ -406,9 +370,7 @@ public:
 
 private:
     HolotonerProcessor& processor_;
-    holotoner::ImageMask mask_;
     std::array<HolotonerProcessor::ScopeSample, 16384> samples_ {};
-    bool hasMask_ = false;
 };
 
 HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
@@ -471,14 +433,11 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
         }
         addAndMakeVisible(slider);
     };
-    configureLabel(targetLabel_, "TARGET");
     configureLabel(channelLabel_, "CHANNEL");
     configureLabel(gainLabel_, "GAIN");
     configureLabel(fillLabel_, "FILL");
     configureLabel(amountLabel_, "AMOUNT");
-    target_.addItemList({"Off", "Spectral place", "Spectral level", "Phase map"}, 1);
     channel_.addItemList({"Off", "Luma", "Alpha", "Red", "Green", "Blue"}, 1);
-    addAndMakeVisible(target_);
     addAndMakeVisible(channel_);
     configureSlider(gain_, false);
     configureSlider(fill_, true);
@@ -487,8 +446,6 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
     invert_.setColour(juce::ToggleButton::textColourId, style::text);
     addAndMakeVisible(normalize_);
     addAndMakeVisible(invert_);
-    targetAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
-        processor_.state(), "image_target", target_);
     channelAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment>(
         processor_.state(), "image_channel", channel_);
     gainAttachment_ = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
@@ -580,7 +537,6 @@ void HolotonerEditor::resized()
         control.setBounds(slot.removeFromTop(28));
         controls.removeFromLeft(6);
     };
-    placeControl(targetLabel_, target_, 122);
     placeControl(channelLabel_, channel_, 84);
     placeControl(gainLabel_, gain_, 116);
     placeControl(fillLabel_, fill_, 116);
@@ -702,7 +658,6 @@ void HolotonerEditor::refresh()
     if (mask != currentMask_ || imageChanged) {
         currentMask_ = mask;
         planeView_->setMask(image != nullptr && mask != nullptr ? mask.get() : nullptr);
-        polarView_->setMask(image != nullptr && mask != nullptr ? mask.get() : nullptr);
     }
 
     juce::String message;
@@ -719,13 +674,9 @@ void HolotonerEditor::refresh()
     else if (kind == SourceKind::File)
         message = processor_.sourceName();
     else
-        message = kind == SourceKind::Clicks ? "Test clicks - Space toggles playback in Standalone"
+        message = kind == SourceKind::Clicks ? "Test clicks"
                                              : "Host input";
     if (image != nullptr)
         message += "    Image: " + image->name;
-    if (target_.getSelectedId() == 4)
-        message += "    Image-constrained phase field; stereo energy is retained.";
-    else
-        message += "    Polar measures audio; image gestures are automatable.";
     status_.setText(message, juce::dontSendNotification);
 }

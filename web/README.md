@@ -22,6 +22,8 @@ The accepted boundary is:
   image steering field. The image stage rotates existing sample pairs without
   changing their combined energy; it is nonlinear and may colour the sound.
   Rebuild the field off the audio thread when geometry/projection changes.
+  This is the only engine: no mode selector or retired spectral paths.
+  Polar renders actual input/output samples only, with no target-image overlay.
   XY rectangle, Polar warp, processed-mask preview, threshold and B/W must
   retain the native semantics; the analyser must measure actual L/R samples.
 - User-selected images and audio remain local.

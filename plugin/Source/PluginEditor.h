@@ -47,8 +47,6 @@ private:
     juce::Label wetLabel_;
     juce::Slider wet_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> wetAttachment_;
-    juce::Label targetLabel_;
-    juce::ComboBox target_;
     juce::Label channelLabel_;
     juce::ComboBox channel_;
     juce::Label gainLabel_;
@@ -66,7 +64,6 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> projectionAttachment_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> thresholdAttachment_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> binaryAttachment_;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> targetAttachment_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> channelAttachment_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> gainAttachment_;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> fillAttachment_;

@@ -8,20 +8,11 @@
 namespace holotoner {
 namespace {
 
-constexpr double kLowHz = 40.0;
 constexpr double kHighHz = 16000.0;
 constexpr double kTiny = 1.0e-12;
 constexpr double kRunaway = 16.0;
 
 float finiteOr(float value, float fallback) { return std::isfinite(value) ? value : fallback; }
-
-ProjectedPoint interpolate(const ProjectedPoint& a, const ProjectedPoint& b, double amount)
-{
-    const auto t = static_cast<float>(amount);
-    return {a.stereo + t * (b.stereo - a.stereo),
-            a.frequency + t * (b.frequency - a.frequency),
-            a.depth + t * (b.depth - a.depth)};
-}
 
 } // namespace
 
@@ -52,15 +43,10 @@ void ImageSpatializer::reset()
     outputLeft_.fill(0.0);
     outputRight_.fill(0.0);
     spectrum_.fill(std::complex<double> {});
-    rows_.fill(RowTarget {});
-    smoothedMask_ = {};
     targetMask_ = {};
     targetMaskIdentity_ = nullptr;
     maskPresence_ = targetMaskPresence_ = 0.0;
     smoothedParameters_ = parameters_;
-    targetWeights_.fill(0.0);
-    targetWeights_[static_cast<std::size_t>(parameters_.target)] = 1.0;
-    analysis_ = {};
     inputAt_ = dryAt_ = outputAt_ = filled_ = sinceHop_ = 0;
     wetCurrent_ = parameters_.wet;
     safetyResets_ = 0;
@@ -90,9 +76,6 @@ void ImageSpatializer::setParameters(Parameters parameters)
     plane.rollDegrees = std::clamp(finiteOr(plane.rollDegrees, 0.0f), -180.0f, 180.0f);
     parameters.imageAmount = std::clamp(finiteOr(parameters.imageAmount, 1.0f), 0.0f, 1.0f);
     parameters.wet = std::clamp(finiteOr(parameters.wet, 1.0f), 0.0f, 1.0f);
-    parameters.target = static_cast<ImageTarget>(
-        std::clamp(static_cast<int>(parameters.target), static_cast<int>(ImageTarget::Off),
-                   static_cast<int>(ImageTarget::Phase)));
     parameters.phaseProjection = parameters.phaseProjection == PhaseProjection::Polar
         ? PhaseProjection::Polar : PhaseProjection::Cartesian;
     parameters_ = parameters;
@@ -156,7 +139,6 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     phaseTransform.scaleX *= targetMask_.aspectX;
     phaseTransform.scaleY *= targetMask_.aspectY;
     buildPhaseControls(projectPlane(phaseTransform));
-    buildRows(projection);
     for (std::size_t i = 0; i < kFftSize; ++i) {
         const auto at = (inputAt_ + i) % kFftSize;
         spectrum_[i] = {static_cast<double>(inputLeft_[at]) * window_[i],
@@ -169,35 +151,14 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     const auto basePosition = static_cast<double>(smoothedParameters_.plane.positionX);
     const std::complex<double> imaginary {0.0, 1.0};
     const auto half = kFftSize / 2;
-    std::array<double, kAnalysisBins> analysisLeft {};
-    std::array<double, kAnalysisBins> analysisRight {};
-    std::array<double, kAnalysisBins> analysisCross {};
-    std::array<std::size_t, kAnalysisBins> analysisCount {};
     for (std::size_t k = 1; k < half; ++k) {
         const auto packed = spectrum_[k];
         const auto mirrored = std::conj(spectrum_[kFftSize - k]);
         const auto inLeft = 0.5 * (packed + mirrored);
         const auto inRight = -0.5 * imaginary * (packed - mirrored);
-        const auto hz = static_cast<double>(k) * sampleRate_ / static_cast<double>(kFftSize);
-        const auto frequency = std::clamp(2.0 * std::log(std::max(hz, kLowHz) / kLowHz)
-                                              / std::log(kHighHz / kLowHz) - 1.0,
-                                          -1.0, 1.0);
-        const auto row = rowForFrequency(frequency);
         std::complex<double> outLeft, outRight;
-        spatialize(inLeft, inRight, signedWidth, basePosition, row, targetWeights_,
-                   smoothedParameters_.imageAmount, outLeft, outRight);
+        spatialize(inLeft, inRight, signedWidth, basePosition, outLeft, outRight);
         applyPhase(k, inLeft, inRight, signedWidth, outLeft, outRight);
-        const auto analysisWet = static_cast<double>(wetCurrent_);
-        const auto analysisOutLeft = inLeft + analysisWet * (outLeft - inLeft);
-        const auto analysisOutRight = inRight + analysisWet * (outRight - inRight);
-        const auto analysisAt = std::min(
-            kAnalysisBins - 1,
-            static_cast<std::size_t>(std::clamp(0.5 * (frequency + 1.0), 0.0, 1.0)
-                                     * static_cast<double>(kAnalysisBins)));
-        analysisLeft[analysisAt] += std::norm(analysisOutLeft);
-        analysisRight[analysisAt] += std::norm(analysisOutRight);
-        analysisCross[analysisAt] += std::real(analysisOutLeft * std::conj(analysisOutRight));
-        ++analysisCount[analysisAt];
         spectrum_[k] = outLeft + imaginary * outRight;
         spectrum_[kFftSize - k] = std::conj(outLeft) + imaginary * std::conj(outRight);
     }
@@ -205,36 +166,11 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     for (const auto k : {std::size_t {0}, half}) {
         std::complex<double> outLeft, outRight;
         spatialize({spectrum_[k].real(), 0.0}, {spectrum_[k].imag(), 0.0}, signedWidth,
-                   basePosition, rowForFrequency(k == 0 ? -1.0 : 1.0), targetWeights_,
-                   smoothedParameters_.imageAmount, outLeft, outRight);
+                   basePosition, outLeft, outRight);
         spectrum_[k] = {outLeft.real(), outRight.real()};
     }
 
     fft_.transform(spectrum_, true);
-    constexpr double spectrumToAmplitude = 2.0 / static_cast<double>(kFftSize);
-    constexpr float analysisDecay = 0.82f;
-    constexpr float directionSmoothing = 0.35f;
-    for (std::size_t i = 0; i < kAnalysisBins; ++i) {
-        const auto count = static_cast<double>(std::max<std::size_t>(analysisCount[i], 1));
-        const auto leftPower = analysisLeft[i] / count;
-        const auto rightPower = analysisRight[i] / count;
-        const auto leftLevel = std::sqrt(leftPower);
-        const auto rightLevel = std::sqrt(rightPower);
-        const auto measuredLevel = static_cast<float>(
-            spectrumToAmplitude * std::sqrt(0.5 * (leftPower + rightPower)));
-        analysis_.level[i] = std::max(measuredLevel, analysisDecay * analysis_.level[i]);
-        if (leftLevel + rightLevel > kTiny) {
-            const auto measuredBalance = static_cast<float>(
-                std::clamp((rightLevel - leftLevel) / (rightLevel + leftLevel), -1.0, 1.0));
-            const auto denominator = std::sqrt(leftPower * rightPower);
-            const auto measuredCorrelation = static_cast<float>(
-                denominator > kTiny ? std::clamp(analysisCross[i] / count / denominator, -1.0, 1.0) : 0.0);
-            analysis_.balance[i] += directionSmoothing * (measuredBalance - analysis_.balance[i]);
-            analysis_.correlation[i] += directionSmoothing
-                * (measuredCorrelation - analysis_.correlation[i]);
-        }
-    }
-    ++analysis_.revision;
     constexpr auto outputSize = 2 * kFftSize;
     const auto inverseScale = 1.0 / static_cast<double>(kFftSize);
     for (std::size_t i = 0; i < kFftSize; ++i) {
@@ -265,25 +201,19 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     smooth(currentPlane.yawDegrees, targetPlane.yawDegrees);
     smooth(currentPlane.rollDegrees, targetPlane.rollDegrees);
     smooth(smoothedParameters_.imageAmount, parameters_.imageAmount);
-    for (std::size_t i = 0; i < smoothedMask_.values.size(); ++i)
-        smooth(smoothedMask_.values[i], targetMask_.values[i]);
     previousSteering_ = steering_;
     steeringBlend_ = 0.0f;
     if (targetMask_.fieldReady)
         for (std::size_t i = 0; i < steering_.size(); ++i)
             smooth(steering_[i], targetMask_.fieldAngles[i]);
     smooth(maskPresence_, targetMaskPresence_);
-    smoothedMask_.hasSource = maskPresence_ > 1.0e-6;
-    const auto selectedTarget = static_cast<std::size_t>(parameters_.target);
-    for (std::size_t i = 0; i < targetWeights_.size(); ++i)
-        smooth(targetWeights_[i], i == selectedTarget ? 1.0 : 0.0);
 }
 
 void ImageSpatializer::constrainField(double& left, double& right)
 {
     const auto mid = 0.5*(left+right), side = 0.5*(right-left);
     const auto level = std::hypot(mid, side);
-    const auto amount = targetWeights_[3]*maskPresence_*smoothedParameters_.imageAmount;
+    const auto amount = maskPresence_*smoothedParameters_.imageAmount;
     steeringBlend_ = std::min(1.0f, steeringBlend_ + 1.0f/static_cast<float>(kHopSize));
     if (level < 1.0e-9 || amount < 1.0e-6 || !targetMask_.fieldReady)
         return;
@@ -349,7 +279,7 @@ void ImageSpatializer::applyPhase(std::size_t bin, std::complex<double> left, st
                                   double signedWidth, std::complex<double>& outLeft,
                                   std::complex<double>& outRight) const
 {
-    const auto amount = targetWeights_[3] * maskPresence_ * smoothedParameters_.imageAmount;
+    const auto amount = maskPresence_ * smoothedParameters_.imageAmount;
     if (amount < 1.0e-9)
         return;
     const auto hz = static_cast<double>(bin) * sampleRate_ / static_cast<double>(kFftSize);
@@ -374,91 +304,24 @@ void ImageSpatializer::applyPhase(std::size_t bin, std::complex<double> left, st
     const auto sharedPhase = std::polar(1.0, common);
     const auto mappedLeft = sharedPhase * (mappedMid - mappedSide);
     const auto mappedRight = sharedPhase * (mappedMid + mappedSide);
-    // The image path smoothly replaces other targets during target automation.
-    const auto mix = targetWeights_[3];
-    outLeft += mix * (mappedLeft - outLeft);
-    outRight += mix * (mappedRight - outRight);
-}
-
-void ImageSpatializer::buildRows(const ProjectedPlane& projection)
-{
-    const auto* mask = &smoothedMask_;
-    for (int y = 0; y < kImageMaskHeight; ++y) {
-        double total = 0.0;
-        double weightedX = 0.0;
-        for (int x = 0; x < kImageMaskWidth; ++x) {
-            const auto value = static_cast<double>(mask->at(x, y));
-            const auto localX = 2.0 * static_cast<double>(x) / static_cast<double>(kImageMaskWidth - 1) - 1.0;
-            total += value;
-            weightedX += value * localX;
-        }
-        const auto centroid = total > kTiny ? weightedX / total : 0.0;
-        double variance = 0.0;
-        if (total > kTiny)
-            for (int x = 0; x < kImageMaskWidth; ++x) {
-                const auto value = static_cast<double>(mask->at(x, y));
-                const auto localX = 2.0 * static_cast<double>(x) / static_cast<double>(kImageMaskWidth - 1) - 1.0;
-                variance += value * (localX - centroid) * (localX - centroid);
-            }
-        const auto u = 0.5 * (centroid + 1.0);
-        const auto vertical = 1.0 - static_cast<double>(y) / static_cast<double>(kImageMaskHeight - 1);
-        const auto bottom = interpolate(projection.corners[0], projection.corners[1], u);
-        const auto top = interpolate(projection.corners[3], projection.corners[2], u);
-        const auto point = interpolate(bottom, top, vertical);
-        const auto leftAtRow = interpolate(projection.corners[0], projection.corners[3], vertical);
-        const auto rightAtRow = interpolate(projection.corners[1], projection.corners[2], vertical);
-        const auto stereoPerLocalX = 0.5 * static_cast<double>(rightAtRow.stereo - leftAtRow.stereo);
-        const auto orientation = projection.signedFacing < 0.0f ? -1.0 : 1.0;
-        auto& row = rows_[static_cast<std::size_t>(y)];
-        row.frequency = point.frequency;
-        row.lateral = point.stereo;
-        row.signedSpread = orientation * std::sqrt(total > kTiny ? variance / total : 0.0)
-            * std::abs(stereoPerLocalX);
-        row.level = total / static_cast<double>(kImageMaskWidth);
-        row.presence = maskPresence_;
-    }
-}
-
-ImageSpatializer::RowTarget ImageSpatializer::rowForFrequency(double normalizedFrequency) const
-{
-    const RowTarget* nearest = &rows_[0];
-    auto distance = std::abs(nearest->frequency - normalizedFrequency);
-    for (const auto& row : rows_) {
-        const auto candidate = std::abs(row.frequency - normalizedFrequency);
-        if (candidate < distance) {
-            distance = candidate;
-            nearest = &row;
-        }
-    }
-    return *nearest;
+    outLeft = mappedLeft;
+    outRight = mappedRight;
 }
 
 void ImageSpatializer::spatialize(std::complex<double> left, std::complex<double> right,
-                                  double signedWidth, double basePosition, const RowTarget& row,
-                                  const std::array<double, 4>& targetWeights, double amount,
-                                  std::complex<double>& outputLeft,
-                                  std::complex<double>& outputRight)
+                                  double signedWidth, double basePosition,
+                                  std::complex<double>& outputLeft, std::complex<double>& outputRight)
 {
     const auto mid = 0.5 * (left + right);
     const auto side = 0.5 * (left - right);
-    const auto brightness = std::clamp(2.0 * row.level, 0.0, 1.0);
-    const auto image = std::clamp(amount * row.presence, 0.0, 1.0);
-    const auto placeAmount = targetWeights[static_cast<std::size_t>(ImageTarget::Place)]
-        * image * brightness;
-    const auto lateral = std::clamp(basePosition + placeAmount * (row.lateral - basePosition), -1.0, 1.0);
+    const auto lateral = std::clamp(basePosition, -1.0, 1.0);
     auto gainLeft = 1.0 - std::max(0.0, lateral);
     auto gainRight = 1.0 + std::min(0.0, lateral);
-    const auto normalization = std::sqrt(std::max(0.5 * (gainLeft * gainLeft + gainRight * gainRight), kTiny));
+    const auto normalization = std::sqrt(std::max(0.5 * (gainLeft*gainLeft + gainRight*gainRight), kTiny));
     gainLeft /= normalization;
     gainRight /= normalization;
-    const auto phase = std::clamp(std::numbers::pi * 0.8 * placeAmount * row.signedSpread,
-                                  -0.8 * std::numbers::pi, 0.8 * std::numbers::pi);
-    const auto placedLeft = mid * std::polar(gainLeft, -0.5 * phase);
-    const auto placedRight = mid * std::polar(gainRight, 0.5 * phase);
-    const auto levelAmount = targetWeights[static_cast<std::size_t>(ImageTarget::Level)] * image;
-    const auto level = 1.0 - levelAmount + levelAmount * brightness;
-    outputLeft = level * (placedLeft + signedWidth * side);
-    outputRight = level * (placedRight - signedWidth * side);
+    outputLeft = mid*gainLeft + signedWidth*side;
+    outputRight = mid*gainRight - signedWidth*side;
 }
 
 std::uint32_t ImageSpatializer::takeSafetyResets()

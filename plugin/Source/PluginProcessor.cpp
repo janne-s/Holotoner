@@ -10,7 +10,7 @@
 
 namespace {
 
-constexpr int kStateVersion = 6;
+constexpr int kStateVersion = 7;
 constexpr int kOldestReadableStateVersion = 2;
 constexpr juce::int64 kMaximumImageFileBytes = 32 * 1024 * 1024;
 constexpr int kMaximumImageDimension = 1024;
@@ -83,7 +83,6 @@ HolotonerProcessor::HolotonerProcessor()
     roll_ = parameters_.getRawParameterValue("roll");
     wet_ = parameters_.getRawParameterValue("wet");
     imageChannel_ = parameters_.getRawParameterValue("image_channel");
-    imageTarget_ = parameters_.getRawParameterValue("image_target");
     imageGain_ = parameters_.getRawParameterValue("image_gain");
     imageFill_ = parameters_.getRawParameterValue("image_fill");
     imageNormalize_ = parameters_.getRawParameterValue("image_normalize");
@@ -94,7 +93,7 @@ HolotonerProcessor::HolotonerProcessor()
     imageBinary_ = parameters_.getRawParameterValue("image_binary");
     jassert(positionX_ != nullptr && positionY_ != nullptr && scaleX_ != nullptr && scaleY_ != nullptr
             && pitch_ != nullptr && yaw_ != nullptr && roll_ != nullptr && wet_ != nullptr
-            && imageChannel_ != nullptr && imageTarget_ != nullptr && imageGain_ != nullptr
+            && imageChannel_ != nullptr && imageGain_ != nullptr
             && imageFill_ != nullptr && imageNormalize_ != nullptr && imageInvert_ != nullptr
             && imageAmount_ != nullptr);
     setLatencySamples(engine_.latencySamples());
@@ -141,9 +140,6 @@ juce::AudioProcessorValueTreeState::ParameterLayout HolotonerProcessor::paramete
         juce::ParameterID {"image_channel", 1}, "Image Channel",
         juce::StringArray {"Off", "Luma", "Alpha", "Red", "Green", "Blue"}, 1));
     layout.add(std::make_unique<juce::AudioParameterChoice>(
-        juce::ParameterID {"image_target", 1}, "Image Target",
-        juce::StringArray {"Off", "Spectral place", "Spectral level", "Phase map"}, 3));
-    layout.add(std::make_unique<juce::AudioParameterChoice>(
         juce::ParameterID {"image_projection", 1}, "Image Projection",
         juce::StringArray {"XY rectangle", "Polar warp"}, 0));
     layout.add(std::make_unique<juce::AudioParameterFloat>(
@@ -179,8 +175,6 @@ void HolotonerProcessor::prepareToPlay(double sampleRate, int)
 {
     holotoner::ImageSpatializer::Parameters spatialParameters;
     spatialParameters.plane = planeTransform();
-    spatialParameters.target = static_cast<holotoner::ImageTarget>(
-        juce::jlimit(0, 3, juce::roundToInt(imageTarget_->load(std::memory_order_relaxed))));
     spatialParameters.phaseProjection = imageProjection_->load(std::memory_order_relaxed) >= 0.5f
         ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
     spatialParameters.imageAmount = imageAmount_->load(std::memory_order_relaxed);
@@ -254,8 +248,6 @@ void HolotonerProcessor::processBlock(juce::AudioBuffer<float>& audio, juce::Mid
 
     holotoner::ImageSpatializer::Parameters spatialParameters;
     spatialParameters.plane = planeTransform();
-    spatialParameters.target = static_cast<holotoner::ImageTarget>(
-        juce::jlimit(0, 3, juce::roundToInt(imageTarget_->load(std::memory_order_relaxed))));
     spatialParameters.phaseProjection = imageProjection_->load(std::memory_order_relaxed) >= 0.5f
         ? holotoner::PhaseProjection::Polar : holotoner::PhaseProjection::Cartesian;
     spatialParameters.imageAmount = imageAmount_->load(std::memory_order_relaxed);
@@ -359,9 +351,26 @@ void HolotonerProcessor::setStateInformation(const void* data, int sizeInBytes)
         imageToRestore.fromBase64Encoding(image->getAllSubText());
         xml->removeChildElement(image, true);
     }
-    const auto state = juce::ValueTree::fromXml(*xml);
+    auto state = juce::ValueTree::fromXml(*xml);
     const auto version = static_cast<int>(state.getProperty("format_version", 0));
     if (version >= kOldestReadableStateVersion && version <= kStateVersion) {
+        // Pre-release mode selection was removed. Preserve explicit Off through Amount,
+        // but migrate Place/Level/Phase to the single image-field engine.
+        bool oldOff = false;
+        for (int i = state.getNumChildren()-1; i >= 0; --i) {
+            const auto child = state.getChild(i);
+            if (child.getProperty("id").toString() == "image_target") {
+                oldOff = static_cast<float>(child.getProperty("value", 3.0f)) < 0.5f;
+                state.removeChild(i, nullptr);
+            }
+        }
+        if (oldOff)
+            for (int i = 0; i < state.getNumChildren(); ++i) {
+                auto child = state.getChild(i);
+                if (child.getProperty("id").toString() == "image_amount")
+                    child.setProperty("value", 0.0f, nullptr);
+            }
+        state.setProperty("format_version", kStateVersion, nullptr);
         parameters_.replaceState(state);
         const bool fileExists = sourceFileToRestore.existsAsFile();
         {
