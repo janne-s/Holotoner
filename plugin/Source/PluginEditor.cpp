@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstring>
 
 namespace {
 
@@ -58,6 +59,33 @@ juce::String formatValue(const juce::RangedAudioParameter& parameter, double num
         ? juce::String(number*1000,2) : juce::String(juce::roundToInt(number*1000)))+" ms";
     return text;
 }
+
+// Artwork that changes only with size or display scale (wells, gradients, grids, text),
+// rendered once at physical resolution and then blitted. Redrawn at the 30 Hz refresh it
+// cost more than the live data drawn over it.
+class CachedLayer {
+public:
+    template <typename Painter>
+    void draw(juce::Graphics& graphics, juce::Rectangle<int> bounds, Painter&& paint)
+    {
+        const auto scale = graphics.getInternalContext().getPhysicalPixelScaleFactor();
+        if (image_.isNull() || bounds != bounds_ || std::abs(scale-scale_) > 1.0e-3f) {
+            bounds_ = bounds;
+            scale_ = scale;
+            image_ = juce::Image(juce::Image::ARGB, std::max(1,juce::roundToInt(static_cast<float>(bounds.getWidth())*scale)),
+                                 std::max(1,juce::roundToInt(static_cast<float>(bounds.getHeight())*scale)), true);
+            juce::Graphics layer(image_);
+            layer.addTransform(juce::AffineTransform::translation(-bounds.toFloat().getPosition()).scaled(scale));
+            paint(layer);
+        }
+        graphics.drawImage(image_, bounds.toFloat());
+    }
+    void invalidate() { image_ = {}; }
+private:
+    juce::Image image_;
+    juce::Rectangle<int> bounds_;
+    float scale_ = 0.0f;
+};
 
 } // namespace
 
@@ -287,25 +315,11 @@ public:
 
     void paint(juce::Graphics& graphics) override
     {
-        const auto well = getLocalBounds().toFloat();
-        style::paintWell(graphics, well);
+        background_.draw(graphics, getLocalBounds(), [this](juce::Graphics& layer) { paintBackground(layer); });
         const auto area = drawingArea();
-        const auto centre = area.getCentre();
-        const auto unit = viewUnit();
-
         graphics.saveState();
         graphics.reduceClipRegion(area.toNearestInt());
-        graphics.setColour(style::grid.withAlpha(0.65f));
-        for (int i = -2; i <= 2; ++i) {
-            const auto offset = static_cast<float>(i) * unit;
-            graphics.drawVerticalLine(juce::roundToInt(centre.x + offset), area.getY(), area.getBottom());
-            graphics.drawHorizontalLine(juce::roundToInt(centre.y + offset), area.getX(), area.getRight());
-        }
-        graphics.setColour(style::textFaint.withAlpha(0.8f));
-        graphics.drawLine(area.getX(), centre.y, area.getRight(), centre.y, 1.0f);
-        graphics.drawLine(centre.x, area.getY(), centre.x, area.getBottom(), 1.0f);
-
-        const auto projected = holotoner::projectPlane(processor_.displayedPlaneTransform());
+        const auto projected = holotoner::projectPlane(shown_);
         const auto points = screenPoints(projected);
         juce::Path plane;
         plane.startNewSubPath(points[0]);
@@ -314,8 +328,8 @@ public:
         plane.closeSubPath();
 
         if (image_.isValid()) {
+            // The affine image transform lands exactly on the plane: no path clip is needed.
             graphics.saveState();
-            graphics.reduceClipRegion(plane);
             graphics.setImageResamplingQuality(juce::Graphics::highResamplingQuality);
             const auto transform = juce::AffineTransform::fromTargetPoints(
                 juce::Point<float> {0.0f, static_cast<float>(image_.getHeight())}, points[0],
@@ -350,22 +364,25 @@ public:
         drawHandle(graphics, handles.scale, style::signal, 6.0f);
         drawHandle(graphics, handles.roll, style::textDim, 5.0f);
         graphics.restoreState();
-
-        if (controlsHeight_ > 0) {
-            const auto y = drawingArea().getBottom() + 6.0f;
-            graphics.setColour(style::grid);
-            graphics.drawHorizontalLine(juce::roundToInt(y), 12.0f, static_cast<float>(getWidth()) - 12.0f);
-        }
-        graphics.setColour(style::text);
-        graphics.setFont(juce::FontOptions(style::kTextTitle, juce::Font::bold));
-        graphics.drawText("Processed image", 12, 7, 150, 18, juce::Justification::centredLeft);
     }
 
     // The geometry rows sit inside this well, below the drawing area.
     void setControlsHeight(int height)
     {
+        if (height == controlsHeight_) return;
         controlsHeight_ = height;
+        background_.invalidate();
         repaint();
+    }
+
+    /** Timer tick: repaint only when the audio-smoothed pose has moved. */
+    void refresh()
+    {
+        const auto transform = processor_.displayedPlaneTransform();
+        if (std::memcmp(&transform, &shown_, sizeof(transform)) != 0) {
+            shown_ = transform;
+            repaint();
+        }
     }
 
     void mouseDown(const juce::MouseEvent& event) override
@@ -410,7 +427,6 @@ public:
         case Drag::None:
             break;
         }
-        repaint();
     }
 
     void mouseUp(const juce::MouseEvent&) override
@@ -429,6 +445,33 @@ private:
         juce::Point<float> topEdge;
         juce::Point<float> roll;
     };
+
+    void paintBackground(juce::Graphics& graphics) const
+    {
+        style::paintWell(graphics, getLocalBounds().toFloat());
+        const auto area = drawingArea();
+        const auto centre = area.getCentre();
+        const auto unit = viewUnit();
+        graphics.saveState();
+        graphics.reduceClipRegion(area.toNearestInt());
+        graphics.setColour(style::grid.withAlpha(0.65f));
+        for (int i = -2; i <= 2; ++i) {
+            const auto offset = static_cast<float>(i) * unit;
+            graphics.drawVerticalLine(juce::roundToInt(centre.x + offset), area.getY(), area.getBottom());
+            graphics.drawHorizontalLine(juce::roundToInt(centre.y + offset), area.getX(), area.getRight());
+        }
+        graphics.setColour(style::textFaint.withAlpha(0.8f));
+        graphics.drawLine(area.getX(), centre.y, area.getRight(), centre.y, 1.0f);
+        graphics.drawLine(centre.x, area.getY(), centre.x, area.getBottom(), 1.0f);
+        graphics.restoreState();
+        if (controlsHeight_ > 0) {
+            graphics.setColour(style::grid);
+            graphics.drawHorizontalLine(juce::roundToInt(area.getBottom() + 6.0f), 12.0f, static_cast<float>(getWidth()) - 12.0f);
+        }
+        graphics.setColour(style::text);
+        graphics.setFont(juce::FontOptions(style::kTextTitle, juce::Font::bold));
+        graphics.drawText("Processed image", 12, 7, 150, 18, juce::Justification::centredLeft);
+    }
 
     juce::Rectangle<float> drawingArea() const
     {
@@ -531,6 +574,8 @@ private:
     }
 
     HolotonerProcessor& processor_;
+    CachedLayer background_;
+    PlaneTransform shown_ {processor_.displayedPlaneTransform()};
     juce::Image image_;
     float aspectX_ = 1.0f, aspectY_ = 1.0f;
     int controlsHeight_ = 0;
@@ -546,29 +591,17 @@ public:
     explicit SpaceView(HolotonerProcessor& processor) : processor_(processor)
     {
         setInterceptsMouseClicks(false, false);
+        refresh();
     }
 
+    // The curve costs thousands of response evaluations: draw it once per changed input.
     void paint(juce::Graphics& graphics) override
     {
-        const auto well = getLocalBounds().toFloat();
-        style::paintWell(graphics, well);
-        update();
-        graphics.setColour(style::text);
-        graphics.setFont(juce::FontOptions(style::kTextTitle, juce::Font::bold));
-        graphics.drawText("Space", 12, 7, 60, 18, juce::Justification::centredLeft);
-        graphics.setFont(juce::FontOptions(style::kTextSmall));
-        // Both ears get the same level from these effects (they differ only in phase), so one curve.
-        graphics.setColour(style::signal);
-        graphics.drawText("level", getWidth() - 180, 7, 40, 18, juce::Justification::centredRight);
-        graphics.setColour(style::text);
-        graphics.drawText("echo time 0-2 s", getWidth() - 132, 7, 120, 18, juce::Justification::centredRight);
-        paintResponse(graphics, well.reduced(12.0f).withTrimmedTop(20.0f));
+        view_.draw(graphics, getLocalBounds(), [this](juce::Graphics& layer) { paintView(layer); });
     }
 
-private:
-    static constexpr double kRangeDb = 18.0;
-
-    void update()
+    /** Timer tick: recompute the inputs and repaint only when one of them changed. */
+    void refresh()
     {
         const auto value = [this](const char* id) {
             return static_cast<double>(processor_.state().getRawParameterValue(id)->load());
@@ -580,13 +613,40 @@ private:
             transform.scaleX *= mask->aspectX;
             transform.scaleY *= mask->aspectY;
         }
+        echoTime_ = processor_.echoTimeSeconds();
+        const std::array<double, 12> inputs {amounts_.interfere, amounts_.feedback, amounts_.echo, amounts_.resonate,
+            echoTime_, transform.positionX, transform.positionY, transform.scaleX, transform.scaleY,
+            transform.pitchDegrees, transform.yawDegrees, transform.rollDegrees};
+        if (inputs == inputs_ && mask == mask_)
+            return;
+        inputs_ = inputs;
         if (mask != mask_) {
             mask_ = mask;
             weights_ = mask != nullptr ? holotoner::spaceRowWeights(*mask) : decltype(weights_) {};
         }
         plane_ = holotoner::projectPlane(transform);
         rings_ = amounts_.resonate > 0.0 ? holotoner::resonators(plane_, weights_) : holotoner::Resonators {};
-        echoTime_ = processor_.echoTimeSeconds();
+        view_.invalidate();
+        repaint();
+    }
+
+private:
+    static constexpr double kRangeDb = 18.0;
+
+    void paintView(juce::Graphics& graphics)
+    {
+        const auto well = getLocalBounds().toFloat();
+        style::paintWell(graphics, well);
+        graphics.setColour(style::text);
+        graphics.setFont(juce::FontOptions(style::kTextTitle, juce::Font::bold));
+        graphics.drawText("Space", 12, 7, 60, 18, juce::Justification::centredLeft);
+        graphics.setFont(juce::FontOptions(style::kTextSmall));
+        // Both ears get the same level from these effects (they differ only in phase), so one curve.
+        graphics.setColour(style::signal);
+        graphics.drawText("level", getWidth() - 180, 7, 40, 18, juce::Justification::centredRight);
+        graphics.setColour(style::text);
+        graphics.drawText("echo time 0-2 s", getWidth() - 132, 7, 120, 18, juce::Justification::centredRight);
+        paintResponse(graphics, well.reduced(12.0f).withTrimmedTop(20.0f));
     }
 
     // Steady-state level: Interfere (with Feedback), then Resonate's boost.
@@ -682,6 +742,8 @@ private:
     double echoTime_ = 0.25;
     std::shared_ptr<const holotoner::ImageMask> mask_;
     std::array<double, holotoner::kImageMaskHeight> weights_ {};
+    std::array<double, 12> inputs_ {};
+    CachedLayer view_;
 };
 
 class HolotonerEditor::PolarView final : public juce::Component {
@@ -691,44 +753,113 @@ public:
         setInterceptsMouseClicks(false, false);
     }
 
+    /** Timer tick: repaint only when the audio thread has published new samples. */
+    void refresh()
+    {
+        if (const auto sequence = processor_.scopeSequence(); sequence != shownSequence_) {
+            shownSequence_ = sequence;
+            repaint();
+        }
+    }
+
     void paint(juce::Graphics& graphics) override
     {
-        const auto well = getLocalBounds().toFloat();
-        style::paintWell(graphics, well);
-        const auto area = well.reduced(16.0f).withTrimmedTop(30.0f).withTrimmedBottom(28.0f);
-        const juce::Point<float> origin {area.getCentreX(), area.getBottom() - 2.0f};
-        const auto radius = std::max(10.0f, std::min(0.5f * area.getWidth() - 4.0f, area.getHeight() - 8.0f));
+        const auto layout = makeLayout();
+        background_.draw(graphics, getLocalBounds(), [&layout](juce::Graphics& layer) { paintGrid(layer, layout); });
+        paintSamples(graphics, layout);
+        labels_.draw(graphics, getLocalBounds(), [this, &layout](juce::Graphics& layer) { paintLabels(layer, layout); });
+        const auto correlation = clamp(processor_.meterState().outputCorrelation, -1.0f, 1.0f);
+        graphics.setColour(correlation >= 0.0f ? style::linkLight : style::signal);
+        const auto centreX = layout.bar.getCentreX();
+        const auto valueX = centreX + 0.5f * layout.bar.getWidth() * correlation;
+        graphics.fillRoundedRectangle(juce::Rectangle<float>::leftTopRightBottom(
+            std::min(centreX, valueX), layout.bar.getY(), std::max(centreX, valueX), layout.bar.getBottom()), 2.5f);
+    }
+
+private:
+    struct Layout {
+        juce::Rectangle<float> well, area, bar;
+        juce::Point<float> origin;
+        float radius = 0.0f;
+    };
+
+    Layout makeLayout() const
+    {
+        Layout layout;
+        layout.well = getLocalBounds().toFloat();
+        layout.area = layout.well.reduced(16.0f).withTrimmedTop(30.0f).withTrimmedBottom(28.0f);
+        layout.origin = {layout.area.getCentreX(), layout.area.getBottom() - 2.0f};
+        layout.radius = std::max(10.0f, std::min(0.5f * layout.area.getWidth() - 4.0f, layout.area.getHeight() - 8.0f));
+        layout.bar = juce::Rectangle<float>(layout.area.getX(), layout.well.getBottom() - 24.0f, layout.area.getWidth(), 5.0f);
+        return layout;
+    }
+
+    static void paintGrid(juce::Graphics& graphics, const Layout& layout)
+    {
+        style::paintWell(graphics, layout.well);
         graphics.saveState();
-        graphics.reduceClipRegion(area.toNearestInt());
+        graphics.reduceClipRegion(layout.area.toNearestInt());
         graphics.setColour(style::grid);
         for (float fraction : {0.25f, 0.5f, 0.75f, 1.0f}) {
-            const auto r = radius * fraction;
-            graphics.drawEllipse(juce::Rectangle<float>(2.0f * r, 2.0f * r).withCentre(origin), 1.0f);
+            const auto r = layout.radius * fraction;
+            graphics.drawEllipse(juce::Rectangle<float>(2.0f * r, 2.0f * r).withCentre(layout.origin), 1.0f);
         }
         for (float degrees : {-45.0f, 0.0f, 45.0f}) {
             const auto angle = degrees * pi / 180.0f;
-            graphics.drawLine(origin.x, origin.y, origin.x + radius * std::sin(angle),
-                              origin.y - radius * std::cos(angle), 1.0f);
-        }
-        const auto toScreen = [origin, radius](holotoner::ScopePoint point) {
-            return juce::Point<float> {origin.x + radius * point.x, origin.y - radius * point.y};
-        };
-        const auto count = processor_.scopeSamples(samples_.data(), static_cast<int>(samples_.size()));
-        // A fixed, labelled +14 dB display gain, applied identically to both
-        // measured input and output. This is NOT a fabricated image trace.
-        for (int layer = 0; layer < 2; ++layer) {
-            graphics.setColour(layer == 0 ? style::textDim.withAlpha(0.18f) : style::signal.withAlpha(0.38f));
-            for (int i = 0; i < count; ++i) {
-                const auto& sample = samples_[static_cast<std::size_t>(i)];
-                const auto left = layer == 0 ? sample.inputLeft : sample.outputLeft;
-                const auto right = layer == 0 ? sample.inputRight : sample.outputRight;
-                if (std::abs(left) + std::abs(right) < 1.0e-6f)
-                    continue;
-                const auto point = toScreen(holotoner::stereoToScopePoint(left * 5.0f, right * 5.0f));
-                graphics.fillRect(juce::Rectangle<float>(1.35f, 1.35f).withCentre(point));
-            }
+            graphics.drawLine(layout.origin.x, layout.origin.y, layout.origin.x + layout.radius * std::sin(angle),
+                              layout.origin.y - layout.radius * std::cos(angle), 1.0f);
         }
         graphics.restoreState();
+        graphics.setColour(style::grid);
+        graphics.fillRoundedRectangle(layout.bar, 2.5f);
+    }
+
+    // Each measured sample is a small square written straight into a bitmap: tens of
+    // thousands of anti-aliased fillRect calls per frame were the editor's largest cost.
+    // A fixed, labelled +14 dB display gain, applied identically to both measured input
+    // and output. This is NOT a fabricated image trace.
+    void paintSamples(juce::Graphics& graphics, const Layout& layout)
+    {
+        const auto area = layout.area.toNearestInt();
+        if (area.isEmpty()) return;
+        const auto scale = graphics.getInternalContext().getPhysicalPixelScaleFactor();
+        const auto width = juce::roundToInt(static_cast<float>(area.getWidth()) * scale);
+        const auto height = juce::roundToInt(static_cast<float>(area.getHeight()) * scale);
+        if (samplesImage_.getWidth() != width || samplesImage_.getHeight() != height)
+            samplesImage_ = juce::Image(juce::Image::ARGB, width, height, true);
+        else
+            samplesImage_.clear(samplesImage_.getBounds());
+        const auto count = processor_.scopeSamples(samples_.data(), static_cast<int>(samples_.size()));
+        const auto dot = std::max(1, juce::roundToInt(1.35f * scale));
+        const auto originX = (layout.origin.x - static_cast<float>(area.getX())) * scale;
+        const auto originY = (layout.origin.y - static_cast<float>(area.getY())) * scale;
+        const auto radius = layout.radius * scale;
+        {
+            juce::Image::BitmapData pixels(samplesImage_, juce::Image::BitmapData::readWrite);
+            for (int layer = 0; layer < 2; ++layer) {
+                const auto colour = (layer == 0 ? style::textDim.withAlpha(0.18f) : style::signal.withAlpha(0.38f)).getPixelARGB();
+                for (int i = 0; i < count; ++i) {
+                    const auto& sample = samples_[static_cast<std::size_t>(i)];
+                    const auto left = layer == 0 ? sample.inputLeft : sample.outputLeft;
+                    const auto right = layer == 0 ? sample.inputRight : sample.outputRight;
+                    if (std::abs(left) + std::abs(right) < 1.0e-6f)
+                        continue;
+                    const auto point = holotoner::stereoToScopePoint(left * 5.0f, right * 5.0f);
+                    const auto x0 = juce::roundToInt(originX + radius * point.x - 0.5f * static_cast<float>(dot));
+                    const auto y0 = juce::roundToInt(originY - radius * point.y - 0.5f * static_cast<float>(dot));
+                    for (int y = std::max(0, y0); y < std::min(height, y0 + dot); ++y)
+                        for (int x = std::max(0, x0); x < std::min(width, x0 + dot); ++x)
+                            reinterpret_cast<juce::PixelARGB*>(pixels.getPixelPointer(x, y))->blend(colour);
+                }
+            }
+        }
+        graphics.drawImage(samplesImage_, area.toFloat());
+    }
+
+    void paintLabels(juce::Graphics& graphics, const Layout& layout) const
+    {
+        const auto& origin = layout.origin;
+        const auto radius = layout.radius;
         // Units: radius is each sample's level, angle its stereo direction.
         // Radius = 1 + log10(5 · level) / 3, so the rings are 15 dB apart, the outer one at -14 dBFS.
         graphics.setFont(juce::FontOptions(style::kTextSmall));
@@ -758,26 +889,18 @@ public:
         graphics.drawText("input", getWidth() - 180, 7, 100, 18, juce::Justification::centredRight);
         graphics.setColour(style::signal);
         graphics.drawText("output", getWidth() - 74, 7, 62, 18, juce::Justification::centredRight);
-        const auto correlation = clamp(processor_.meterState().outputCorrelation, -1.0f, 1.0f);
-        const auto bar = juce::Rectangle<float>(area.getX(), well.getBottom() - 24.0f, area.getWidth(), 5.0f);
         graphics.setColour(style::textFaint);
-        graphics.setFont(juce::FontOptions(style::kTextSmall));
-        const auto scale = bar.withY(bar.getBottom() + 2.0f).withHeight(12.0f);
+        const auto scale = layout.bar.withY(layout.bar.getBottom() + 2.0f).withHeight(12.0f);
         graphics.drawText("-1 opposite", scale, juce::Justification::centredLeft);
         graphics.drawText("correlation", scale, juce::Justification::centred);
         graphics.drawText("same +1", scale, juce::Justification::centredRight);
-        graphics.setColour(style::grid);
-        graphics.fillRoundedRectangle(bar, 2.5f);
-        graphics.setColour(correlation >= 0.0f ? style::linkLight : style::signal);
-        const auto centreX = bar.getCentreX();
-        const auto valueX = centreX + 0.5f * bar.getWidth() * correlation;
-        graphics.fillRoundedRectangle(juce::Rectangle<float>::leftTopRightBottom(
-            std::min(centreX, valueX), bar.getY(), std::max(centreX, valueX), bar.getBottom()), 2.5f);
     }
 
-private:
     HolotonerProcessor& processor_;
     std::array<HolotonerProcessor::ScopeSample, 16384> samples_ {};
+    CachedLayer background_, labels_;
+    juce::Image samplesImage_;
+    std::uint64_t shownSequence_ = 0;
 };
 
 HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
@@ -862,6 +985,9 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
     shapeOrder_ = knob("shape_order","Order"); shapeOrder_->setRow(true);
     depth_->setRow(true); tempo_->setRow(true);
     motionPanel_.addAndMakeVisible(shape_); motionPanel_.addAndMakeVisible(*depth_);
+    motionPanel_.addAndMakeVisible(resetMotion_);
+    resetMotion_.setTooltip("Reset motion: every Rate and note off, Swing and Depth to defaults");
+    resetMotion_.onClick = [this] { resetMotion(); };
     motionPanel_.addChildComponent(*tempo_);
     tempo_->setVisible(processor_.wrapperType == juce::AudioProcessor::wrapperType_Standalone);
     addAndMakeVisible(*planeView_); addAndMakeVisible(*polarView_); addAndMakeVisible(*spaceView_);
@@ -1029,7 +1155,9 @@ void HolotonerEditor::resized()
     auto rows = juce::Rectangle<int>(0,0,planeWell_.getWidth()-24,kMotionHeight).withTrimmedTop(4).withTrimmedBottom(10);
     auto header = rows.removeFromTop(headerHeight);
     rows.removeFromTop(4);
-    rateTitle_.setBounds(header.removeFromRight(AxisRow::kRateWidth));
+    auto rateHeader = header.removeFromRight(AxisRow::kRateWidth);
+    resetMotion_.setBounds(rateHeader.removeFromRight(44));
+    rateTitle_.setBounds(rateHeader);
     motionTitle_.setBounds(header.removeFromLeft(58));
     shape_.setBounds(header.removeFromLeft(70).withSizeKeepingCentre(70,kControlHeight)); header.removeFromLeft(10);
     depth_->setBounds(header.removeFromLeft(depth_->rowNameWidth()+64)); header.removeFromLeft(6);
@@ -1124,9 +1252,9 @@ void HolotonerEditor::timerCallback()
         layoutMotion();
     }
     refresh();
-    spaceView_->repaint();
-    planeView_->repaint();
-    polarView_->repaint();
+    spaceView_->refresh();
+    planeView_->refresh();
+    polarView_->refresh();
 }
 
 void HolotonerEditor::chooseAudioFile()
@@ -1157,14 +1285,32 @@ void HolotonerEditor::chooseImageFile()
 
 void HolotonerEditor::resetTransform()
 {
-    constexpr std::array<const char*, 7> ids {"position_x", "position_y", "scale_x", "scale_y", "pitch", "yaw", "roll"};
-    constexpr std::array<float, 7> values {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f};
-    for (const auto* id : ids)
-        beginParameter(processor_, id);
-    for (std::size_t i = 0; i < ids.size(); ++i)
-        setParameter(processor_, ids[i], values[i]);
-    for (const auto* id : ids)
-        endParameter(processor_, id);
+    resetToDefaults({"position_x", "position_y", "scale_x", "scale_y", "pitch", "yaw", "roll"});
+}
+
+// Motion only: every axis Rate and ♪ off, Swing and Depth to their defaults. Base
+// geometry stays where it is (Reset plane owns that).
+void HolotonerEditor::resetMotion()
+{
+    juce::StringArray ids {"motion_shape", "motion_depth"};
+    for (const auto* axis : HolotonerProcessor::kMotionAxes)
+        ids.addArray({juce::String(axis)+"_rate", juce::String(axis)+"_rate_sync"});
+    resetToDefaults(ids);
+}
+
+// One host gesture per parameter around the whole change, as for a direct edit.
+void HolotonerEditor::resetToDefaults(const juce::StringArray& ids)
+{
+    for (const auto& id : ids)
+        if (auto* target = processor_.state().getParameter(id))
+            target->beginChangeGesture();
+    for (const auto& id : ids)
+        if (auto* target = processor_.state().getParameter(id))
+            target->setValueNotifyingHost(target->getDefaultValue());
+    for (const auto& id : ids)
+        if (auto* target = processor_.state().getParameter(id))
+            target->endChangeGesture();
+    refresh();
 }
 
 void HolotonerEditor::refresh()

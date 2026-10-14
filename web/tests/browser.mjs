@@ -40,6 +40,14 @@ window.__downloads=[];const create=URL.createObjectURL;URL.createObjectURL=funct
  assert.ok(Math.abs(iconCentre.x)<.01&&Math.abs(iconCentre.y)<.01);
  await evaluate(`document.querySelector('#motion-depth').value=.8;document.querySelector('#motion-depth').dispatchEvent(new Event('change'));document.querySelector('#motion-depth').dispatchEvent(new MouseEvent('dblclick'));`);
  assert.equal(await evaluate('document.querySelector("#motion-depth").value'),'0.5');
+ // Motion Reset: every Rate and note off, Swing and Depth to defaults; base geometry stays.
+ await evaluate(`(()=>{const rows=[...document.querySelectorAll('.axis')];const rate=rows[0].querySelector('.rate');rate.value=1.5;rate.dispatchEvent(new Event('change'));rows[2].querySelector('button').click();const depth=document.querySelector('#motion-depth');depth.value=.9;depth.dispatchEvent(new Event('change'));const shape=document.querySelector('#motion-shape');shape.selectedIndex=1;shape.dispatchEvent(new Event('change'));const yaw=document.querySelector('#yaw');yaw.value=40;yaw.dispatchEvent(new Event('input'));document.querySelector('#reset-motion').click();})()`);
+ await evaluate('document.querySelector("#save").click()');await wait('window.__downloads.length>1');
+ {const reset=(await evaluate('window.__downloads.at(-1).text().then(JSON.parse)')).parameters;
+  for(const axis of ['pitch','yaw','roll','position_x','position_y','scale_x','scale_y'])assert.ok(reset[axis+'_rate']===0&&reset[axis+'_rate_sync']===0,'motion reset left '+axis+' moving');
+  assert.equal(reset.motion_depth,.5);assert.equal(reset.motion_shape,0);assert.equal(reset.yaw,40,'motion reset changed base geometry');
+  assert.equal(await evaluate('document.querySelector(".axis .rate").value'),'0');assert.equal(await evaluate('document.querySelector("#motion-shape").selectedIndex'),0);
+  await evaluate(`document.querySelector('#yaw').value=0;document.querySelector('#yaw').dispatchEvent(new Event('input'));`);}
  await evaluate(`document.querySelector('#image_smooth').value=.001;document.querySelector('#image_smooth').dispatchEvent(new Event('input'));document.querySelector('#image_smooth').dispatchEvent(new MouseEvent('dblclick'));`);
  assert.equal(await evaluate('document.querySelector("#image_smooth").value'),'0');
  const smoothPoint=await evaluate(`(()=>{const r=document.querySelector('#image_smooth').getBoundingClientRect();return{x:r.x+r.width/2,y:r.y+r.height/2};})()`);
@@ -191,5 +199,5 @@ window.__downloads=[];const create=URL.createObjectURL;URL.createObjectURL=funct
   assert.ok(layout.scroll<=width);assert.ok(portrait?layout.right.top>layout.left.top:layout.right.left>layout.left.left);
   await verifyClampedHandles(true);
  }
- assert.equal(errors.length,0,JSON.stringify(errors));console.log('Browser checks passed: default Smiley, visible roll drag direction, Smooth control/reset/state and legacy migration, playback, mono, Unicode frames, state restore/rejection, local media, plane gestures and clamped edge handles (mouse/touch), automatic Shape activation, Smiley state, auto Shape/Order, Depth reset, centred restart icon, Time sync, neutral slider fills, fixed transport width, portrait and landscape.');
+ assert.equal(errors.length,0,JSON.stringify(errors));console.log('Browser checks passed: default Smiley, visible roll drag direction, Smooth control/reset/state and legacy migration, playback, mono, Unicode frames, state restore/rejection, local media, plane gestures and clamped edge handles (mouse/touch), automatic Shape activation, Smiley state, auto Shape/Order, Depth reset, Motion reset, centred restart icon, Time sync, neutral slider fills, fixed transport width, portrait and landscape.');
 }finally{await send('Page.close');socket.close();await rm(directory,{recursive:true,force:true});}

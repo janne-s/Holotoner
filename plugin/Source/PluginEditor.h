@@ -26,6 +26,8 @@ private:
     void chooseAudioFile();
     void chooseImageFile();
     void resetTransform();
+    void resetMotion();
+    void resetToDefaults(const juce::StringArray& ids);
     void refresh();
     void layoutMotion();
     static constexpr int kMotionHeight = 190;
@@ -51,7 +53,7 @@ private:
     juce::TextButton loadAudio_ {"Audio..."},restart_ {"Restart"},play_ {"Stop"},
         loadImage_ {"Image..."},reset_ {"Reset plane"},textButton_ {"Text"},motionButton_ {"Motion"},
         applyText_ {"Use text"},closeText_ {"Close"},shapeButton_ {"Shape"},useShape_ {"Use shape"},
-        closeShape_ {"Close"};
+        closeShape_ {"Close"},resetMotion_ {"Reset"};
     juce::ToggleButton normalize_ {"Normalize"},invert_ {"Invert"},binary_ {"B/W"},textPlay_ {"Cycle"},delta_ {"Delta"};
     juce::TextEditor textInput_;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> comboAttachments_;

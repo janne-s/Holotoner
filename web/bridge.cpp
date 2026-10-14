@@ -2,6 +2,7 @@
 #include "core/geometry/Motion.h"
 #include "core/image/ShapeGenerator.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <emscripten/emscripten.h>
@@ -17,6 +18,11 @@ ImageMask banks[2][32], compiled;
 int bank = 0, frames = 0, frame = 0, at = 0;
 double rate = 48000;
 std::uint64_t epoch = 0;
+// Bumped whenever mask contents may change in place (commit or compile), so
+// ht_visual can cache the mask's row weights between analyser snapshots.
+std::uint64_t maskGeneration = 0, weightsGeneration = ~std::uint64_t{0};
+const ImageMask *weightsMask = nullptr;
+std::array<double, kImageMaskHeight> weights{};
 CycleClock axes[7], textClock;
 PlaneTransform visible;
 PlaneTransform base() {
@@ -61,6 +67,7 @@ EMSCRIPTEN_KEEPALIVE int ht_mask_size() { return sizeof(ImageMask); }
 EMSCRIPTEN_KEEPALIVE void ht_commit(int which, int count) {
   bank = std::clamp(which, 0, 1);
   frames = std::clamp(count, 0, 32);
+  ++maskGeneration;
 }
 EMSCRIPTEN_KEEPALIVE void ht_reset() {
   engine.reset();
@@ -89,6 +96,7 @@ EMSCRIPTEN_KEEPALIVE void ht_compile(int width, int height) {
   s.threshold = params[22];
   s.binary = params[23] > 0;
   compiled = buildImageMask(im, s);
+  ++maskGeneration;
 }
 EMSCRIPTEN_KEEPALIVE void ht_shape(int kind, int order) {
   auto im =
@@ -213,13 +221,20 @@ EMSCRIPTEN_KEEPALIVE void ht_visual(int live) {
   int div = std::clamp(static_cast<int>(params[26]), 0, 23);
   if (div)
     a.echoTime = kSyncBeats[div] * 60 / std::max(20.0f, params[24]);
-  auto weights = spaceRowWeights(mask);
-  auto rings = resonators(plane, weights);
+  if (&mask != weightsMask || maskGeneration != weightsGeneration) {
+    weights = spaceRowWeights(mask);
+    weightsMask = &mask;
+    weightsGeneration = maskGeneration;
+  }
+  // Resonate 0 multiplies the resonance by zero: skip computing it.
+  const bool ringing = a.resonate > 0;
+  const auto rings = ringing ? resonators(plane, weights) : Resonators{};
   for (int i = 0; i < 128; ++i) {
     double hz = 60 * std::pow(16000.0 / 60, i / 127.0);
     auto ear = interfereResponse(plane, a, hz);
     double level = std::abs(ear.left) *
-                   (1 + kResonanceBoost * a.resonate * resonance(rings, hz));
+                   (ringing ? 1 + kResonanceBoost * a.resonate * resonance(rings, hz)
+                            : 1.0);
     response[i * 3] =
         static_cast<float>(20 * std::log10(std::max(1e-6, level)));
     response[i * 3 + 1] =

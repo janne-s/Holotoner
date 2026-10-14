@@ -4,8 +4,23 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#101215">
-<meta name="description" content="Image-driven stereo processing.">
-<title>Holotoner</title>
+<meta name="description" content="Holotoner turns an image into a stereo field: move and rotate the image plane, and hear the space change.">
+<meta property="og:title" content="Holotoner · Turn an image into a stereo field">
+<meta property="og:description" content="Turn an image into a stereo field. Move, scale and rotate the image plane, watch it in the sound field and hear the space change. Use an image, text or a generated shape, right in the browser.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://janne-s.github.io/Holotoner/">
+<meta property="og:image" content="https://janne-s.github.io/Holotoner/assets/og_image.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Holotoner with a smiley image plane in motion and the same smiley traced by the sound in the polar sound field">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:creator" content="@JanneSarkela">
+<meta name="twitter:title" content="Holotoner · Turn an image into a stereo field">
+<meta name="twitter:description" content="Turn an image into a stereo field. Move, scale and rotate the image plane, watch it in the sound field and hear the space change. Use an image, text or a generated shape, right in the browser.">
+<meta name="twitter:image" content="https://janne-s.github.io/Holotoner/assets/og_image.jpg">
+<meta name="twitter:image:alt" content="Holotoner with a smiley image plane in motion and the same smiley traced by the sound in the polar sound field">
+<title>Holotoner · Turn an image into a stereo field</title>
+<link rel="canonical" href="https://janne-s.github.io/Holotoner/">
 <link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="./style.css">
 </head>
@@ -41,7 +56,7 @@
     </div>
     <div id="shape-panel" class="overlay" hidden><div id="shape-controls"><select id="shape-kind" aria-label="Shape"><option>Grid</option><option>Checker</option><option>Rings</option><option>Triangle</option><option>Sierpinski</option><option>Spiral</option><option>Lissajous</option><option>Smiley</option></select><label>Order <input id="shape-order" type="number" value="3" min="1" max="8"></label></div></div>
     <div class="well-caption"><button id="motion-toggle" aria-expanded="false">Motion ▴</button></div>
-    <div id="motion" hidden><div class="motion-header"><select id="motion-shape" aria-label="Motion shape"><option>Swing</option><option>Spin</option></select><label>Depth <input id="motion-depth" type="range" min="0" max="1" step="0.01" value="0.5"></label></div><div id="motion-axes"></div></div>
+    <div id="motion" hidden><div class="motion-header"><select id="motion-shape" aria-label="Motion shape"><option>Swing</option><option>Spin</option></select><label>Depth <input id="motion-depth" type="range" min="0" max="1" step="0.01" value="0.5"></label><button id="reset-motion" type="button" title="Reset motion: every Rate and note off, Swing and Depth to defaults">Reset</button></div><div id="motion-axes"></div></div>
   </div>
 </section>
 <section class="audio-panel">

@@ -5,6 +5,8 @@
 - GitHub SVG in `index.html` — From Echotect, © 2026 Janne Särkelä,
   MIT. See `ECHOTECT-LICENSE`.
 - `icon.svg` — Original Holotoner monogram, AGPL-3.0-only.
+- `screenshot.jpg` and `og_image.jpg` — Holotoner interface captures supplied by
+  Janne Särkelä for the README and link previews. AGPL-3.0-only.
 - `holotoner.wasm` — Shared C++ engine, built with Emscripten 4.0.22.
   See [third-party notices](../THIRD_PARTY.md).
 - `source.tar.gz` and `LICENSE` — Source and licence packaged by the Pages workflow.

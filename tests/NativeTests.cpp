@@ -75,6 +75,35 @@ void smoothStateTests()
           "Pre-Smooth state retained the running processor's Smooth");
 }
 
+// Motion's Reset: every axis Rate and note off, Swing and Depth to defaults; the base
+// geometry and other sections stay as they were.
+void motionResetTests()
+{
+    HolotonerProcessor processor;
+    set(processor, "roll_rate", 1.5f); set(processor, "yaw_rate_sync", 9.0f); set(processor, "scale_y_rate", 0.3f);
+    set(processor, "motion_depth", 0.9f); set(processor, "motion_shape", 1.0f);
+    set(processor, "yaw", 40.0f); set(processor, "wet", 0.5f);
+    auto editor = std::unique_ptr<juce::AudioProcessorEditor>(processor.createEditor());
+    juce::TextButton* reset = nullptr;
+    std::function<void(juce::Component&)> find = [&](juce::Component& c) {
+        if (auto* button = dynamic_cast<juce::TextButton*>(&c); button != nullptr && button->getButtonText() == "Reset")
+            reset = button;
+        for (auto* child : c.getChildren()) find(*child);
+    };
+    find(*editor);
+    check(reset != nullptr, "Motion has no Reset button");
+    if (reset == nullptr) return;
+    reset->onClick();
+    const auto value = [&](const juce::String& id) { return processor.state().getRawParameterValue(id)->load(); };
+    for (const auto* axis : HolotonerProcessor::kMotionAxes)
+        check(value(juce::String(axis)+"_rate") == 0.0f && value(juce::String(axis)+"_rate_sync") == 0.0f,
+              "Motion Reset left an axis moving");
+    check(std::abs(value("motion_depth")-0.5f) < 1.0e-6f && value("motion_shape") == 0.0f,
+          "Motion Reset did not restore Swing and Depth");
+    check(std::abs(value("yaw")-40.0f) < 1.0e-4f && std::abs(value("wet")-0.5f) < 1.0e-6f,
+          "Motion Reset changed base geometry or another section");
+}
+
 void shapeSourceTests()
 {
     HolotonerProcessor shape;
@@ -606,6 +635,7 @@ int main()
     textAndMotionTests();
     shapeSourceTests();
     smoothStateTests();
+    motionResetTests();
     letterARegression();
     return failures == 0 ? 0 : 1;
 }

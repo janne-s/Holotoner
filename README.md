@@ -4,6 +4,10 @@ Holotoner turns an image into a stereo field. Move, scale and rotate the image
 plane, and hear the space change. Use an image, text or a generated shape.
 Available as Standalone, VST3, AU and a browser application.
 
+See it live: [**https://janne-s.github.io/Holotoner/**](https://janne-s.github.io/Holotoner/)
+
+![Holotoner interface](web/assets/screenshot.jpg)
+
 ## How it works
 
 The plane's pose sets stereo position and width. A centred Y rotation of 90°
@@ -21,7 +25,8 @@ pink. Its radius follows sample level, with +14 dB display gain.
   rolls. Double-click resets the pose.
 - **Motion** — Rotation X/Y/Z, Move X/Y and Scale X/Y, each with its own Rate
   and ♪. Swing uses Depth; Spin turns rotation axes once per cycle. Motion adds
-  to the base values. Green ticks show the moving position.
+  to the base values. Green ticks show the moving position. Reset turns every
+  Rate and ♪ off and returns Swing and Depth to their defaults; the plane stays.
 - **Channel** — Off, Luma, Alpha, Red, Green or Blue.
 - **Gain**, **Fill**, **Threshold** — Shape the mask. Fill affects opaque pixels.
   Normalize, Invert and B/W change its contrast.

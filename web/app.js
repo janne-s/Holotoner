@@ -48,7 +48,7 @@ let state = {...defaults}, core, module, worker, node, context, source,
 let playing = false, offset = 0, started = 0, job = 0, pendingJobs = new Map(),
     liveCorners, liveResponse, measured, activeFrame = 0, lastSnapshot = 0,
     initializing;
-let snapshotBuffer;
+let snapshotBuffer, sourceVersion = 0, scopeVersion = 0;
 const snapshotBuffers = [
   new ArrayBuffer(snapshotByteLength), new ArrayBuffer(snapshotByteLength)
 ];
@@ -98,6 +98,13 @@ function format(key, v) {
     return `${Math.round(v * 1000)} ms`;
   return `${Math.round(v * 100)}%`;
 }
+const markers = new Map(), markerLefts = new Map();
+const markerOf = key => {
+  if (!markers.has(key))
+    markers.set(key,
+                controls.get(key).input.closest('.axis').querySelector('i'));
+  return markers.get(key);
+};
 function refreshControl(key) {
   const c = controls.get(key);
   if (!c)
@@ -114,8 +121,7 @@ function refreshControl(key) {
     const position = (state[key] - c.min) / (c.max - c.min) * 100;
     c.input.style.setProperty('--fill-start', `${Math.min(origin, position)}%`);
     c.input.style.setProperty('--fill-end', `${Math.max(origin, position)}%`);
-    const marker = c.input.closest('.axis').querySelector('i');
-    marker.hidden = true;
+    markerOf(key).hidden = true;
   }
 }
 function knob(parent, key, label, min = 0, max = 1, step = .001) {
@@ -330,6 +336,15 @@ for (const name of ['text', 'shape'])
     if (name === 'shape' && !$(name + '-panel').hidden)
       await applyShape();
   });
+// Motion only: every axis Rate and note off, Swing and Depth to defaults. The
+// base geometry stays (Reset plane owns that).
+$('reset-motion').onclick = () => {
+  for (const key of ['motion_shape', 'motion_depth',
+                     ...axisKeys.flatMap(k => [k + '_rate', k + '_rate_sync'])])
+    state[key] = defaults[key];
+  sendState();
+  refreshAll();
+};
 $('reset-plane').onclick = () => {
   for (const key of axisKeys)
     state[key] = defaults[key];
@@ -417,6 +432,7 @@ async function setup() {
         requestedImages = images;
         masks = data.masks;
         previews = data.previews;
+        ++sourceVersion;
         sourceMeta = pending.meta;
         sourceReady = true;
         activeFrame = clamp(activeFrame, 0, previews.length - 1);
@@ -458,6 +474,10 @@ async function initAudio() {
     node.port.onmessage = ({data}) => {
       if (data.type === 'snapshot') {
         lastSnapshot = 0;
+        // Silence and pauses repeat identical packets: count only new content.
+        if (!measured || measured.length !== data.scope.length ||
+            measured.some((v, i) => v !== data.scope[i]))
+          ++scopeVersion;
         if (snapshotBuffer)
           snapshotBuffers.push(snapshotBuffer);
         snapshotBuffer = data.scope.buffer;
@@ -465,18 +485,29 @@ async function initAudio() {
         liveCorners = data.corners;
         liveResponse = data.response;
         activeFrame = data.metrics[2];
+        // Write the DOM only when a value changes: every write invalidates
+        // style and layout, and this runs at the analyser rate.
         axisKeys.forEach((key, i) => {
-          const control = controls.get(key);
-          const marker = control.input.closest('.axis').querySelector('i');
-          marker.hidden = Math.abs(data.plane[i] - state[key]) <=
-                          .001 * (control.max - control.min);
-          marker.style.left = `${
-              100 *
-              clamp((data.plane[i] - control.min) / (control.max - control.min),
-                    0, 1)}%`;
+          const control = controls.get(key), marker = markerOf(key);
+          const hidden = Math.abs(data.plane[i] - state[key]) <=
+                         .001 * (control.max - control.min);
+          if (marker.hidden !== hidden)
+            marker.hidden = hidden;
+          const left = `${
+              (100 * clamp((data.plane[i] - control.min) /
+                               (control.max - control.min),
+                           0, 1))
+                  .toFixed(2)}%`;
+          if (!hidden && markerLefts.get(key) !== left) {
+            markerLefts.set(key, left);
+            marker.style.left = left;
+          }
         });
-        $('correlation').value = data.metrics[0].toFixed(2);
-        $('correlation-tick').style.left = `${50 + 50 * data.metrics[0]}%`;
+        const correlation = data.metrics[0].toFixed(2);
+        if ($('correlation').value !== correlation) {
+          $('correlation').value = correlation;
+          $('correlation-tick').style.left = `${50 + 50 * +correlation}%`;
+        }
         if (data.metrics[3] > 0)
           status('Engine recovered from invalid audio.', true);
       }
@@ -842,45 +873,105 @@ $('state-file').onchange = safely(async () => {
 });
 // Canvas display uses the core's projected corners. The polar receives measured
 // points only.
-const maskCanvas = document.createElement('canvas');
-maskCanvas.width = maskCanvas.height = 64;
+// Each canvas is redrawn only when what it shows changes; static artwork is
+// rendered once per size. Sizes come from a ResizeObserver, so drawing never
+// forces a synchronous layout.
+const canvasSizes = new Map();
+const resizes = new ResizeObserver(entries => {
+  for (const entry of entries)
+    canvasSizes.set(entry.target.id, entry.contentRect);
+});
+for (const id of ['plane', 'scope', 'response'])
+  resizes.observe($(id));
+function canvasSize(id) {
+  const rect = canvasSizes.get(id) || $(id).getBoundingClientRect();
+  return {
+    w : rect.width,
+    h : rect.height,
+    dpr : Math.min(devicePixelRatio || 1, 2)
+  };
+}
+const drawn = new Map();
+function changed(id, key) {
+  const {w, h, dpr} = canvasSize(id);
+  key = `${w}x${h}@${dpr}|${key}`;
+  if (drawn.get(id) === key)
+    return false;
+  drawn.set(id, key);
+  return true;
+}
 function canvasContext(id) {
-  const canvas = $(id), rect = canvas.getBoundingClientRect(),
-        dpr = Math.min(devicePixelRatio || 1, 2),
-        w = Math.max(1, Math.round(rect.width * dpr)),
-        h = Math.max(1, Math.round(rect.height * dpr));
+  const canvas = $(id), {w : cssW, h : cssH, dpr} = canvasSize(id),
+                 w = Math.max(1, Math.round(cssW * dpr)),
+                 h = Math.max(1, Math.round(cssH * dpr));
   if (canvas.width !== w || canvas.height !== h) {
     canvas.width = w;
     canvas.height = h;
   }
   const c = canvas.getContext('2d');
   c.setTransform(dpr, 0, 0, dpr, 0, 0);
-  c.clearRect(0, 0, rect.width, rect.height);
-  return {c, w : rect.width, h : rect.height};
+  c.clearRect(0, 0, cssW, cssH);
+  return {c, w : cssW, h : cssH, dpr};
 }
+const layers = new Map();
+function cachedLayer(name, w, h, dpr, paint) {
+  const key = `${w}x${h}@${dpr}`;
+  let layer = layers.get(name);
+  if (!layer || layer.key !== key) {
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.round(w * dpr));
+    canvas.height = Math.max(1, Math.round(h * dpr));
+    const c = canvas.getContext('2d');
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    paint(c);
+    layers.set(name, layer = {key, canvas});
+  }
+  return layer.canvas;
+}
+const maskCanvases = new WeakMap();
+function maskCanvas(mask) {
+  let canvas = maskCanvases.get(mask);
+  if (!canvas) {
+    canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 64;
+    const m = canvas.getContext('2d'), data = m.createImageData(64, 64);
+    for (let i = 0; i < 4096; i++) {
+      data.data[i * 4] = 255;
+      data.data[i * 4 + 1] = 79;
+      data.data[i * 4 + 2] = 174;
+      data.data[i * 4 + 3] = Math.round(clamp(mask[i], 0, 1) * 255);
+    }
+    m.putImageData(data, 0, 0);
+    maskCanvases.set(mask, canvas);
+  }
+  return canvas;
+}
+const coarsePointer = matchMedia('(pointer: coarse)');
 let handles = {};
 function planeDraw(corners) {
-  const {c, w, h} = canvasContext('plane'), unit = Math.min(w * .34, h * .35),
-               cx = w / 2, cy = h / 2;
-  c.strokeStyle = line;
-  c.lineWidth = .5;
-  for (let i = -4; i <= 4; i++) {
-    c.beginPath();
-    c.moveTo(cx + i * unit / 2, 0);
-    c.lineTo(cx + i * unit / 2, h);
-    c.stroke();
-    c.beginPath();
-    c.moveTo(0, cy + i * unit / 2);
-    c.lineTo(w, cy + i * unit / 2);
-    c.stroke();
-  }
-  c.strokeStyle = dim;
-  c.beginPath();
-  c.moveTo(cx - 5, cy);
-  c.lineTo(cx + 5, cy);
-  c.moveTo(cx, cy - 5);
-  c.lineTo(cx, cy + 5);
-  c.stroke();
+  const {c, w, h, dpr} = canvasContext('plane'),
+        unit = Math.min(w * .34, h * .35), cx = w / 2, cy = h / 2;
+  c.drawImage(cachedLayer('plane-grid', w, h, dpr, g => {
+    g.strokeStyle = line;
+    g.lineWidth = .5;
+    for (let i = -4; i <= 4; i++) {
+      g.beginPath();
+      g.moveTo(cx + i * unit / 2, 0);
+      g.lineTo(cx + i * unit / 2, h);
+      g.stroke();
+      g.beginPath();
+      g.moveTo(0, cy + i * unit / 2);
+      g.lineTo(w, cy + i * unit / 2);
+      g.stroke();
+    }
+    g.strokeStyle = dim;
+    g.beginPath();
+    g.moveTo(cx - 5, cy);
+    g.lineTo(cx + 5, cy);
+    g.moveTo(cx, cy - 5);
+    g.lineTo(cx, cy + 5);
+    g.stroke();
+  }), 0, 0, w, h);
   if (!corners)
     return;
   const points = [];
@@ -889,20 +980,12 @@ function planeDraw(corners) {
         {x : cx + corners[i * 3] * unit, y : cy - corners[i * 3 + 1] * unit});
   const mask = previews[activeFrame] || previews[0];
   if (mask) {
-    const m = maskCanvas.getContext('2d'), data = m.createImageData(64, 64);
-    for (let i = 0; i < 4096; i++) {
-      data.data[i * 4] = 255;
-      data.data[i * 4 + 1] = 79;
-      data.data[i * 4 + 2] = 174;
-      data.data[i * 4 + 3] = Math.round(clamp(mask[i], 0, 1) * 255);
-    }
-    m.putImageData(data, 0, 0);
     const p0 = points[3], p1 = points[2], p2 = points[0];
     c.save();
     c.transform((p1.x - p0.x) / 64, (p1.y - p0.y) / 64, (p2.x - p0.x) / 64,
                 (p2.y - p0.y) / 64, p0.x, p0.y);
     c.imageSmoothingEnabled = false;
-    c.drawImage(maskCanvas, 0, 0);
+    c.drawImage(maskCanvas(mask), 0, 0);
     c.restore();
   }
   c.strokeStyle = pink;
@@ -917,7 +1000,7 @@ function planeDraw(corners) {
   };
   // Match the native panel: clamp only the interaction points, leaving the
   // projected image unchanged. Drawing and hit testing use these same points.
-  const inset = matchMedia('(pointer: coarse)').matches ? 22 : 8;
+  const inset = coarsePointer.matches ? 22 : 8;
   const constrain = p =>
       ({x : clamp(p.x, inset, w - inset), y : clamp(p.y, inset, h - inset)});
   handles = {
@@ -953,50 +1036,51 @@ function planeDraw(corners) {
   }
 }
 function scopeDraw() {
-  const {c, w, h} = canvasContext('scope'), r = Math.min(w * .44, h - 42),
-               cx = w / 2, cy = h - 22;
-  c.lineWidth = .6;
-  c.font = '9px monospace';
-  c.textAlign = 'center';
-  for (let i = 1; i <= 4; i++) {
-    c.strokeStyle = line;
-    c.beginPath();
-    c.arc(cx, cy, r * i / 4, Math.PI, Math.PI * 2);
-    c.stroke();
-    c.fillStyle = dim;
-    c.fillText(`${- 14 - (4 - i) * 15} dB`, cx + 7, cy - r * i / 4 + 10);
-  }
-  for (let angle = -90; angle <= 90; angle += 45) {
-    const a = angle * Math.PI / 180;
-    c.strokeStyle = line;
-    c.beginPath();
-    c.moveTo(cx, cy);
-    c.lineTo(cx + r * Math.sin(a), cy - r * Math.cos(a));
-    c.stroke();
-  }
+  const {c, w, h, dpr} = canvasContext('scope'), r = Math.min(w * .44, h - 42),
+                    cx = w / 2, cy = h - 22;
+  c.drawImage(cachedLayer('scope-grid', w, h, dpr, g => {
+    g.lineWidth = .6;
+    g.font = '9px monospace';
+    g.textAlign = 'center';
+    for (let i = 1; i <= 4; i++) {
+      g.strokeStyle = line;
+      g.beginPath();
+      g.arc(cx, cy, r * i / 4, Math.PI, Math.PI * 2);
+      g.stroke();
+      g.fillStyle = dim;
+      g.fillText(`${- 14 - (4 - i) * 15} dB`, cx + 7, cy - r * i / 4 + 10);
+    }
+    for (let angle = -90; angle <= 90; angle += 45) {
+      const a = angle * Math.PI / 180;
+      g.strokeStyle = line;
+      g.beginPath();
+      g.moveTo(cx, cy);
+      g.lineTo(cx + r * Math.sin(a), cy - r * Math.cos(a));
+      g.stroke();
+    }
+    g.fillStyle = dim;
+    g.fillText('MONO', cx, cy - r - 6);
+    g.fillText('L', cx - r * .72, cy - r * .72);
+    g.fillText('R', cx + r * .72, cy - r * .72);
+    g.textAlign = 'left';
+    g.fillText('OUT OF PHASE', cx - r, cy + 14);
+    g.textAlign = 'right';
+    g.fillText('OUT OF PHASE', cx + r, cy + 14);
+  }), 0, 0, w, h);
+  if (!measured)
+    return;
+  c.globalAlpha = .16;
   c.fillStyle = dim;
-  c.fillText('MONO', cx, cy - r - 6);
-  c.fillText('L', cx - r * .72, cy - r * .72);
-  c.fillText('R', cx + r * .72, cy - r * .72);
-  c.textAlign = 'left';
-  c.fillText('OUT OF PHASE', cx - r, cy + 14);
-  c.textAlign = 'right';
-  c.fillText('OUT OF PHASE', cx + r, cy + 14);
-  if (measured) {
-    c.globalAlpha = .16;
-    c.fillStyle = dim;
-    for (let i = 0; i < measured.length; i += 4)
-      if (measured[i] !== 0 || measured[i + 1] !== 0)
-        c.fillRect(cx + measured[i] * r, cy - measured[i + 1] * r, 1, 1);
-    c.globalAlpha = .62;
-    c.fillStyle = pink;
-    for (let i = 0; i < measured.length; i += 4)
-      if (measured[i + 2] !== 0 || measured[i + 3] !== 0)
-        c.fillRect(cx + measured[i + 2] * r, cy - measured[i + 3] * r, 1.25,
-                   1.25);
-    c.globalAlpha = 1;
-  }
-  c.textAlign = 'left';
+  for (let i = 0; i < measured.length; i += 4)
+    if (measured[i] !== 0 || measured[i + 1] !== 0)
+      c.fillRect(cx + measured[i] * r, cy - measured[i + 1] * r, 1, 1);
+  c.globalAlpha = .62;
+  c.fillStyle = pink;
+  for (let i = 0; i < measured.length; i += 4)
+    if (measured[i + 2] !== 0 || measured[i + 3] !== 0)
+      c.fillRect(cx + measured[i + 2] * r, cy - measured[i + 3] * r, 1.25,
+                 1.25);
+  c.globalAlpha = 1;
 }
 function responseDraw(data) {
   const {c, w, h} = canvasContext('response'), x0 = 30, y0 = 20, ww = w - 50,
@@ -1054,11 +1138,15 @@ function draw(now) {
       response = new Float32Array(core.memory.buffer, core.ht_buffer(9), 384);
       activeFrame = clamp(state.text_frame - 1, 0, previews.length - 1);
     }
-    planeDraw(corners);
-    responseDraw(response);
-  } else
+    if (changed('plane', `${corners.join()}|${activeFrame}|${sourceVersion}|${
+                             coarsePointer.matches}`))
+      planeDraw(corners);
+    if (changed('response', `${state.space_echo > 0}|${response.join()}`))
+      responseDraw(response);
+  } else if (changed('plane', 'none'))
     planeDraw();
-  scopeDraw();
+  if (changed('scope', measured ? scopeVersion : 'none'))
+    scopeDraw();
   if (node && snapshotBuffers.length &&
       (!lastSnapshot || now - lastSnapshot > 1000)) {
     lastSnapshot = now;

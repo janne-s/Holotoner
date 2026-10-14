@@ -1040,15 +1040,6 @@ void HolotonerProcessor::rebuildImageMaskIfNeeded()
     settings.amount = 1.0f;
     settings.threshold = imageThreshold_->load(std::memory_order_relaxed);
     settings.binary = imageBinary_->load(std::memory_order_relaxed) >= 0.5f;
-    std::vector<std::shared_ptr<const ImageDocument>> images;
-    std::uint64_t mediaVersion = 0, request = 0;
-    {
-        std::lock_guard lock(imageMutex_);
-        images = textFrames_;
-        if (images.empty() && image_ != nullptr) images.push_back(image_);
-        mediaVersion = mediaVersion_.load();
-        request = imageRequest_.load();
-    }
     const bool settingsChanged = !hasBuiltMaskSettings_
         || settings.channel != builtMaskSettings_.channel
         || std::abs(settings.gain - builtMaskSettings_.gain) > 1.0e-6f
@@ -1057,9 +1048,21 @@ void HolotonerProcessor::rebuildImageMaskIfNeeded()
         || settings.invert != builtMaskSettings_.invert
         || settings.binary != builtMaskSettings_.binary
         || std::abs(settings.threshold - builtMaskSettings_.threshold) > 1.0e-6f;
-    if (images == maskImages_ && !settingsChanged
-        && mediaVersion == bankVersion_.load())
-        return;
+    std::vector<std::shared_ptr<const ImageDocument>> images;
+    std::uint64_t mediaVersion = 0, request = 0;
+    {
+        std::lock_guard lock(imageMutex_);
+        mediaVersion = mediaVersion_.load();
+        // Compare in place first: this runs at 30 Hz and almost never needs a rebuild.
+        const bool sameImages = textFrames_.empty()
+            ? (image_ == nullptr ? maskImages_.empty() : maskImages_.size() == 1 && maskImages_.front() == image_)
+            : textFrames_ == maskImages_;
+        if (sameImages && !settingsChanged && mediaVersion == bankVersion_.load())
+            return;
+        images = textFrames_;
+        if (images.empty() && image_ != nullptr) images.push_back(image_);
+        request = imageRequest_.load();
+    }
     maskImages_ = images;
     builtMaskSettings_ = settings;
     hasBuiltMaskSettings_ = true;

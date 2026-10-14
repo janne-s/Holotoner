@@ -110,7 +110,10 @@ private:
     void applyEffects(std::size_t bin, const SpaceAmounts& amounts, const Resonators& rings,
                       std::complex<double>& left, std::complex<double>& right);
     void buildPhaseControls(const ProjectedPlane&);
-    void applyPhase(std::size_t bin, std::complex<double> left, std::complex<double> right,
+    /// Per-frame inputs of applyPhase, computed once per hop instead of once per bin.
+    struct PhaseFrame { double amount = 0.0, baseAngle = 0.0; };
+    PhaseFrame phaseFrame() const;
+    void applyPhase(std::size_t bin, const PhaseFrame& frame, std::complex<double> left, std::complex<double> right,
                     double signedWidth, std::complex<double>& outLeft, std::complex<double>& outRight) const;
     double frameSmoothing_ = 1.0;
     float wetCurrent_ = 1.0f;

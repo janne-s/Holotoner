@@ -109,6 +109,7 @@ h2 { font-size: 11px; font-weight: 500; margin: 0; white-space: nowrap; }
 .motion-header { display: flex; align-items: center; gap: 12px; font-size: 10px; margin-bottom: 5px; }
 .motion-header label { display: flex; align-items: center; gap: 6px; }
 .motion-header input { width: 65px; }
+#reset-motion { margin-left: auto; min-height: 22px; padding: 2px 7px; font-size: 10px; }
 .axis {
   display: grid;
   grid-template-columns: 68px 1fr 48px 60px 20px;

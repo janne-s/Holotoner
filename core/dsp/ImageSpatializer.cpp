@@ -194,6 +194,7 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     const auto basePosition = static_cast<double>(smoothedParameters_.plane.positionX);
     const std::complex<double> imaginary {0.0, 1.0};
     const auto half = kFftSize / 2;
+    const auto phase = phaseFrame();
     for (std::size_t k = 1; k < half; ++k) {
         const auto packed = spectrum_[k];
         const auto mirrored = std::conj(spectrum_[kFftSize - k]);
@@ -201,7 +202,7 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
         const auto inRight = -0.5 * imaginary * (packed - mirrored);
         std::complex<double> outLeft, outRight;
         spatialize(inLeft, inRight, signedWidth, basePosition, outLeft, outRight);
-        applyPhase(k, inLeft, inRight, signedWidth, outLeft, outRight);
+        applyPhase(k, phase, inLeft, inRight, signedWidth, outLeft, outRight);
         if (spaced)
             applyEffects(k, space, rings, outLeft, outRight);
         spectrum_[k] = outLeft + imaginary * outRight;
@@ -469,12 +470,18 @@ void ImageSpatializer::buildPhaseControls(const ProjectedPlane& projection)
     phaseInitialized_ = true;
 }
 
-void ImageSpatializer::applyPhase(std::size_t bin, std::complex<double> left, std::complex<double> right,
-                                  double signedWidth, std::complex<double>& outLeft,
-                                  std::complex<double>& outRight) const
+ImageSpatializer::PhaseFrame ImageSpatializer::phaseFrame() const
 {
     const auto facing = std::abs(std::cos(static_cast<double>(smoothedParameters_.plane.yawDegrees)*std::numbers::pi/180));
-    const auto amount = maskPresence_ * smoothedParameters_.imageAmount*facing;
+    return {maskPresence_ * smoothedParameters_.imageAmount*facing,
+            0.5 * std::asin(std::clamp(static_cast<double>(smoothedParameters_.plane.positionX), -1.0, 1.0))};
+}
+
+void ImageSpatializer::applyPhase(std::size_t bin, const PhaseFrame& frame, std::complex<double> left,
+                                  std::complex<double> right, double signedWidth, std::complex<double>& outLeft,
+                                  std::complex<double>& outRight) const
+{
+    const auto amount = frame.amount;
     if (amount < 1.0e-9)
         return;
     const auto hz = static_cast<double>(bin) * sampleRate_ / static_cast<double>(kFftSize);
@@ -483,8 +490,7 @@ void ImageSpatializer::applyPhase(std::size_t bin, std::complex<double> left, st
     const auto t = position - static_cast<double>(at);
     const auto& a = phaseControls_[at];
     const auto& b = phaseControls_[at + 1];
-    const auto baseAngle = 0.5 * std::asin(std::clamp(
-        static_cast<double>(smoothedParameters_.plane.positionX), -1.0, 1.0));
+    const auto baseAngle = frame.baseAngle;
     const auto angle = baseAngle + amount * (a.angle + t * (b.angle - a.angle) - baseAngle);
     const auto relative = amount * (a.relative + t * (b.relative - a.relative));
     const auto common = amount * (a.common + t * (b.common - a.common));

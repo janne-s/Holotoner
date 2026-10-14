@@ -67,6 +67,8 @@ public:
     struct ScopeSample { float inputLeft, inputRight, outputLeft, outputRight; };
     // UI-only read of a bounded, non-tearing atomic sample history.
     int scopeSamples(ScopeSample* destination, int capacity) const;
+    /** Total samples published to the scope; changes only while audio is processed. */
+    std::uint64_t scopeSequence() const { return scopePublished_.load(std::memory_order_acquire); }
 
     void setSourceKind(holotoner::SourceKind kind) { sourceKind_.store(static_cast<int>(kind)); }
     holotoner::SourceKind sourceKind() const
