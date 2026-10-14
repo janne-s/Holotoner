@@ -552,6 +552,49 @@ async function loadDemo() {
   $('audio-name').textContent = audioLabel;
   status('Demo loaded.');
 }
+// iOS treats Web Audio as ambient sound, which the silent switch mutes.
+// Declaring the page's audio session as playback (Safari 16.4+) makes it media,
+// which plays through the switch; older iOS takes the session from an HTML
+// audio element, so there a silent one loops while sound plays.
+let silence = null;
+function declarePlayback() {
+  if ('audioSession' in navigator) {
+    try {
+      navigator.audioSession.type = 'playback';
+    } catch {
+      // Not settable here.
+    }
+    return;
+  }
+  silence ??= silentLoop();
+  silence.play().catch(() => {
+    // Without a gesture or support, Web Audio plays as it would.
+  });
+}
+function silentLoop() {
+  const rate = 8000, samples = rate / 2, bytes = new Uint8Array(44 + samples),
+        view = new DataView(bytes.buffer);
+  const text = (at, value) =>
+      [...value].forEach((char, i) => bytes[at + i] = char.charCodeAt(0));
+  text(0, 'RIFF');
+  view.setUint32(4, 36 + samples, true);
+  text(8, 'WAVEfmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true);
+  view.setUint32(28, rate, true);
+  view.setUint16(32, 1, true);
+  view.setUint16(34, 8, true);
+  text(36, 'data');
+  view.setUint32(40, samples, true);
+  bytes.fill(128, 44);
+  const audio =
+      new Audio(`data:audio/wav;base64,${btoa(String.fromCharCode(...bytes))}`);
+  audio.loop = true;
+  audio.setAttribute('playsinline', '');
+  return audio;
+}
 function stop() {
   if (source) {
     offset = (offset + (context.currentTime - started)) % audioBuffer.duration;
@@ -592,6 +635,8 @@ function audioAction(fn) {
   return safely(async (...args) => {
     if (audioBusy || audioFailed || !module)
       return;
+    // First thing in the gesture: iOS accepts the session change only here.
+    declarePlayback();
     audioBusy = true;
     const buttons = [ 'play', 'restart', 'demo', 'load-audio' ].map($);
     for (const button of buttons)
@@ -606,9 +651,11 @@ function audioAction(fn) {
   });
 }
 $('play').onclick = audioAction(async () => {
-  if (playing)
+  if (playing) {
     stop();
-  else
+    // Restart and loading stop only to play again: the silence ends on Pause.
+    silence?.pause();
+  } else
     await play();
 });
 $('restart').onclick = audioAction(async () => {
