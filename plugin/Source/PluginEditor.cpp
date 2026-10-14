@@ -1000,15 +1000,16 @@ HolotonerEditor::HolotonerEditor(HolotonerProcessor& owner)
     motionHeight_ = processor_.motionPanelOpen ? static_cast<float>(kMotionHeight) : 0.0f;
     addChildComponent(*textPanel_);
     textPanel_->addAndMakeVisible(textInput_);
-    textPanel_->addAndMakeVisible(applyText_); textPanel_->addAndMakeVisible(closeText_);
+    textPanel_->addAndMakeVisible(closeText_);
     // Text playback belongs to the text source: it lives in the Text panel, not in Image.
     for (auto* c : std::array<juce::Component*,4> {&textLayout_,&textPlay_,frame_.get(),textRate_.get()})
         textPanel_->addAndMakeVisible(c);
     frame_->setRow(true); textRate_->setRow(true);
     textInput_.setMultiLine(false);
     textInput_.setText(processor_.text(),false); lastText_ = processor_.text();
-    applyText_.onClick = [this] { processor_.setText(textInput_.getText()); };
-    textInput_.onReturnKey = [this] { processor_.setText(textInput_.getText()); };
+    // Text applies as it is edited, like Shape: after a short pause in typing, Return at once.
+    textInput_.onTextChange = [this] { textPending_ = true; textEditedAt_ = juce::Time::getMillisecondCounter(); };
+    textInput_.onReturnKey = [this] { applyText(); };
     // Text and Shape share the overlay row over the image well; one is open at a time.
     addChildComponent(*shapePanel_);
     for (auto* c : std::array<juce::Component*,4> {&shapeKind_,shapeOrder_.get(),&useShape_,&closeShape_})
@@ -1175,7 +1176,6 @@ void HolotonerEditor::resized()
     auto rowsArea = textPanel_->getLocalBounds().reduced(8);
     auto input = rowsArea.removeFromTop(kControlHeight);
     closeText_.setBounds(input.removeFromRight(52)); input.removeFromRight(4);
-    applyText_.setBounds(input.removeFromRight(72)); input.removeFromRight(8);
     textInput_.setBounds(input);
     rowsArea.removeFromTop(6);
     auto play = rowsArea.removeFromTop(kControlHeight);
@@ -1243,8 +1243,18 @@ void HolotonerEditor::layoutMotion()
     motionButton_.setBounds(planeWell_.getRight()-12-84,planeWell_.getBottom()-std::max(height,12)-kControlHeight-2,84,kControlHeight);
 }
 
+void HolotonerEditor::applyText()
+{
+    textPending_ = false;
+    const auto value = textInput_.getText();
+    if (value.trim().isEmpty() || value == processor_.text()) return; // blank keeps the current source
+    lastText_ = value;
+    processor_.setText(value);
+}
+
 void HolotonerEditor::timerCallback()
 {
+    if (textPending_ && juce::Time::getMillisecondCounter() - textEditedAt_ >= 300) applyText();
     const auto target = processor_.motionPanelOpen ? static_cast<float>(kMotionHeight) : 0.0f;
     if (std::abs(motionHeight_-target) > 0.0f) {
         motionHeight_ += 0.45f*(target-motionHeight_);
@@ -1319,7 +1329,8 @@ void HolotonerEditor::refresh()
     xyButton_.setToggleState(!polar,juce::dontSendNotification);
     polarButton_.setToggleState(polar,juce::dontSendNotification);
     const auto value = processor_.text();
-    if (value != lastText_) { lastText_ = value; textInput_.setText(value,false); }
+    // Never replace text that is being typed with an older rendered value.
+    if (value != lastText_ && !textPending_ && !textInput_.hasKeyboardFocus(true)) { lastText_ = value; textInput_.setText(value,false); }
     for (auto& row : axes_) row->refresh();
     motionButton_.setButtonText(juce::String::fromUTF8(processor_.motionPanelOpen ? "Motion \u25BE" : "Motion \u25B4"));
     for (auto* cell : std::array<KnobCell*,12> {gain_.get(),fill_.get(),threshold_.get(),depth_.get(),

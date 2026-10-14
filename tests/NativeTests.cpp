@@ -104,6 +104,31 @@ void motionResetTests()
           "Motion Reset changed base geometry or another section");
 }
 
+// Text applies as it is typed, without Return or a Use text button.
+void liveTextTests()
+{
+    HolotonerProcessor processor;
+    auto editor = std::unique_ptr<juce::AudioProcessorEditor>(processor.createEditor());
+    juce::TextEditor* input = nullptr;
+    bool useText = false;
+    std::function<void(juce::Component&)> find = [&](juce::Component& c) {
+        if (auto* editorField = dynamic_cast<juce::TextEditor*>(&c)) input = editorField;
+        if (auto* button = dynamic_cast<juce::TextButton*>(&c); button != nullptr && button->getButtonText() == "Use text")
+            useText = true;
+        for (auto* child : c.getChildren()) find(*child);
+    };
+    find(*editor);
+    check(input != nullptr && !useText, "Text panel still needs a Use text button");
+    if (input == nullptr) return;
+    input->setText("LIVE", false);
+    input->onTextChange(); // what a keystroke delivers through the message loop
+    for (int i = 0; i < 100 && !(processor.text() == "LIVE" && waitForMask(processor)); ++i) {
+        juce::Thread::sleep(20);
+        juce::Timer::callPendingTimersSynchronously();
+    }
+    check(processor.text() == "LIVE" && input->getText() == "LIVE", "typed text did not apply without Return");
+}
+
 void shapeSourceTests()
 {
     HolotonerProcessor shape;
@@ -636,6 +661,7 @@ int main()
     shapeSourceTests();
     smoothStateTests();
     motionResetTests();
+    liveTextTests();
     letterARegression();
     return failures == 0 ? 0 : 1;
 }

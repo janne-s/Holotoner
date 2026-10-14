@@ -29,6 +29,7 @@ private:
     void resetMotion();
     void resetToDefaults(const juce::StringArray& ids);
     void refresh();
+    void applyText();
     void layoutMotion();
     static constexpr int kMotionHeight = 190;
     static constexpr int kControlHeight = 22; ///< every button and menu
@@ -52,7 +53,7 @@ private:
     juce::TextButton xyButton_ {"XY"},polarButton_ {"Polar"}; ///< Projection, on the sound field
     juce::TextButton loadAudio_ {"Audio..."},restart_ {"Restart"},play_ {"Stop"},
         loadImage_ {"Image..."},reset_ {"Reset plane"},textButton_ {"Text"},motionButton_ {"Motion"},
-        applyText_ {"Use text"},closeText_ {"Close"},shapeButton_ {"Shape"},useShape_ {"Use shape"},
+        closeText_ {"Close"},shapeButton_ {"Shape"},useShape_ {"Use shape"},
         closeShape_ {"Close"},resetMotion_ {"Reset"};
     juce::ToggleButton normalize_ {"Normalize"},invert_ {"Invert"},binary_ {"B/W"},textPlay_ {"Cycle"},delta_ {"Delta"};
     juce::TextEditor textInput_;
@@ -62,6 +63,8 @@ private:
     std::shared_ptr<const HolotonerProcessor::ImageDocument> currentImage_;
     std::shared_ptr<const holotoner::ImageMask> currentMask_;
     juce::String lastText_;
+    bool textPending_ = false;
+    juce::uint32 textEditedAt_ = 0; ///< ms counter of the last unapplied edit
     bool dragOver_ = false;
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(HolotonerEditor)
 };

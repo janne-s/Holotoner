@@ -299,12 +299,19 @@ for (const [id, key] of [[ 'normalize', 'image_normalize' ],
 for (const [id, key, min, max] of [[ 'tempo', 'tempo', 20, 300 ],
                                    [ 'motion-depth', 'motion_depth', 0, 1 ],
                                    [ 'text-step', 'text_frame', 1, 32 ],
-                                   [ 'text-rate', 'text_rate', 0, 8 ]])
+                                   [ 'text-rate', 'text_rate', 0, 8 ]]) {
+  // Applies while typing; the field is normalized only when it is left, so a
+  // partial entry such as "0." is not rewritten under the cursor.
+  $(id).oninput = () => {
+    if ($(id).value !== '' && Number.isFinite(+$(id).value))
+      update(key, clamp(+$(id).value, min, max));
+  };
   $(id).onchange = () => {
     const v = clamp(+$(id).value, min, max);
     $(id).value = v;
     update(key, v);
   };
+}
 $('motion-depth').ondblclick = () => {
   $('motion-depth').value = defaults.motion_depth;
   update('motion_depth', defaults.motion_depth);
@@ -766,15 +773,29 @@ function rasterText(text) {
     pixels : new Uint8Array(o.getImageData(0, 0, out.width, out.height).data)
   };
 }
-$('text-form').onsubmit = safely(async e => {
-  e.preventDefault();
+// Text applies as it is edited, like Shape: typing after a short pause, Layout
+// at once, Enter immediately. Blank text keeps the current source.
+async function applyText() {
+  clearTimeout(textTimer);
   const text = $('text').value, layout = $('text-layout').value;
+  if (!text.trim())
+    return;
   const frames = textFrames(text, layout).map(rasterText);
   await compile(frames, {kind : 'text', text, layout, name : `Text: ${text}`});
-  state.text_frame = 1;
+  state.text_frame = clamp(state.text_frame, 1, frames.length);
   sendState();
   refreshAll();
   status('Text loaded / ' + frames.length + ' frame(s).');
+}
+let textTimer;
+$('text').oninput = () => {
+  clearTimeout(textTimer);
+  textTimer = setTimeout(safely(applyText), 300);
+};
+$('text-layout').onchange = safely(applyText);
+$('text-form').onsubmit = safely(async e => {
+  e.preventDefault();
+  await applyText();
 });
 async function applyShape() {
   const input = $('shape-order');

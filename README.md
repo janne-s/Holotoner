@@ -18,7 +18,8 @@ pink. Its radius follows sample level, with +14 dB display gain.
 ## Image
 
 - **Image…**, **Text**, **Shape** — Choose the picture. Text can play Whole,
-  Characters or Words; Cycle advances at Rate or its ♪ note value.
+  Characters or Words; Cycle advances at Rate or its ♪ note value. Text and
+  its settings apply as you edit them.
   Shape opens the selected generator; Shape and Order changes apply immediately.
   Smiley is the default; its Order sets stroke weight.
 - **Plane** — Drag to move. The corner handles rotate and scale; the top handle
