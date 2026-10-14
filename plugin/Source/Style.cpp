@@ -1,4 +1,5 @@
 #include "Style.h"
+#include <algorithm>
 #include <cmath>
 
 namespace holotoner_style {
@@ -82,6 +83,29 @@ void HolotonerLook::drawRotarySlider(juce::Graphics& g,int x,int y,int width,int
     g.drawLine({centre.getPointOnCircumference(radius*0.35f,angle),centre.getPointOnCircumference(radius-3,angle)},1.6f);
 }
 
+int HolotonerLook::getSliderThumbRadius(juce::Slider&) { return 4; }
+
+void HolotonerLook::drawLinearSlider(juce::Graphics& g,int x,int y,int width,int height,float position,float minimum,
+                                     float maximum,juce::Slider::SliderStyle sliderStyle,juce::Slider& slider)
+{
+    if (sliderStyle != juce::Slider::LinearHorizontal) {
+        LookAndFeel_V4::drawLinearSlider(g,x,y,width,height,position,minimum,maximum,sliderStyle,slider);
+        return;
+    }
+    // A thin track filled from the parameter's default (0 for bipolar axes, 1 for scale).
+    const auto centre = static_cast<float>(y)+0.5f*static_cast<float>(height);
+    const auto left = static_cast<float>(x),right = static_cast<float>(x+width);
+    g.setColour(holotoner_style::grid);
+    g.fillRoundedRectangle(juce::Rectangle<float>::leftTopRightBottom(left,centre-1.5f,right,centre+1.5f),1.5f);
+    const auto origin = std::clamp(slider.getDoubleClickReturnValue(),slider.getMinimum(),slider.getMaximum());
+    const auto from = static_cast<float>(slider.getPositionOfValue(origin));
+    g.setColour(slider.isEnabled() ? holotoner_style::signal : holotoner_style::textFaint);
+    g.fillRoundedRectangle(juce::Rectangle<float>::leftTopRightBottom(std::min(from,position),centre-1.5f,
+                                                                      std::max(from,position),centre+1.5f),1.5f);
+    g.setColour(slider.isMouseOverOrDragging() ? holotoner_style::linkLight : holotoner_style::text);
+    g.fillRoundedRectangle(juce::Rectangle<float>(4.0f,12.0f).withCentre({position,centre}),2.0f);
+}
+
 void HolotonerLook::drawComboBox(juce::Graphics& graphics, int width, int height, bool, int, int, int, int,
                                  juce::ComboBox& box)
 {
@@ -100,6 +124,28 @@ void HolotonerLook::positionComboBoxText(juce::ComboBox& box, juce::Label& label
     label.setJustificationType(juce::Justification::centred);
 }
 
-juce::Font HolotonerLook::getComboBoxFont(juce::ComboBox&) { return juce::FontOptions(11.0f); }
+juce::Font HolotonerLook::getComboBoxFont(juce::ComboBox&) { return juce::FontOptions(holotoner_style::kTextBody); }
 
-juce::Font HolotonerLook::getTextButtonFont(juce::TextButton&, int) { return juce::FontOptions(11.0f); }
+juce::Font HolotonerLook::getTextButtonFont(juce::TextButton&, int) { return juce::FontOptions(holotoner_style::kTextBody); }
+
+juce::Font HolotonerLook::getPopupMenuFont() { return juce::FontOptions(holotoner_style::kTextTitle); }
+
+void HolotonerLook::drawToggleButton(juce::Graphics& g,juce::ToggleButton& button,bool highlighted,bool)
+{
+    using namespace holotoner_style;
+    auto area = button.getLocalBounds();
+    const auto box = area.removeFromLeft(18).toFloat().withSizeKeepingCentre(13.0f,13.0f);
+    g.setColour(raised.brighter(highlighted ? 0.06f : 0.0f));
+    g.fillRoundedRectangle(box,3.0f);
+    if (button.getToggleState()) {
+        juce::Path tick;
+        tick.startNewSubPath(box.getX()+3.0f,box.getCentreY());
+        tick.lineTo(box.getX()+5.5f,box.getBottom()-3.5f);
+        tick.lineTo(box.getRight()-3.0f,box.getY()+3.5f);
+        g.setColour(button.isEnabled() ? linkLight : textFaint);
+        g.strokePath(tick,juce::PathStrokeType(1.6f,juce::PathStrokeType::curved,juce::PathStrokeType::rounded));
+    }
+    g.setColour(button.isEnabled() ? text : textFaint);
+    g.setFont(juce::FontOptions(kTextBody));
+    g.drawText(button.getButtonText(),area.withTrimmedLeft(4),juce::Justification::centredLeft);
+}

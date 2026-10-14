@@ -37,4 +37,7 @@ struct ProjectedPlane {
  */
 ProjectedPlane projectPlane(const PlaneTransform& transform);
 
+/** The point at local (u, v) of a projected plane, u left→right and v bottom→top in 0..1. */
+ProjectedPoint planePoint(const ProjectedPlane& plane, float u, float v);
+
 } // namespace holotoner

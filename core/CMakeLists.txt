@@ -3,9 +3,11 @@ add_library(holotoner_core STATIC
     dsp/Fft.cpp
     dsp/ImageSpatializer.cpp
     dsp/PhaseMap.cpp
+    dsp/SpaceCues.cpp
     dsp/StereoWidth.cpp
     geometry/PlaneProjection.cpp
-    image/ImageMask.cpp)
+    image/ImageMask.cpp
+    image/ShapeGenerator.cpp)
 
 target_include_directories(holotoner_core PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(holotoner_core PUBLIC cxx_std_20)

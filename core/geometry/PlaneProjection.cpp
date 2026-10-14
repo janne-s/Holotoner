@@ -84,4 +84,15 @@ ProjectedPlane projectPlane(const PlaneTransform& transform)
     return result;
 }
 
+ProjectedPoint planePoint(const ProjectedPlane& plane, float u, float v)
+{
+    // The plane is affine: a + u(b - a) + v(d - a) of corners 0, 1 and 3.
+    const auto& a = plane.corners[0];
+    const auto& b = plane.corners[1];
+    const auto& d = plane.corners[3];
+    return {a.stereo + u * (b.stereo - a.stereo) + v * (d.stereo - a.stereo),
+            a.frequency + u * (b.frequency - a.frequency) + v * (d.frequency - a.frequency),
+            a.depth + u * (b.depth - a.depth) + v * (d.depth - a.depth)};
+}
+
 } // namespace holotoner

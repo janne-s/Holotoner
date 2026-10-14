@@ -17,6 +17,10 @@ inline const juce::Colour link {0xff168a62};
 inline const juce::Colour linkLight {0xff3ccf9b};
 
 inline constexpr float corner = 5.0f;
+// Spectral's three text sizes: names and values, body (buttons, groups), titles.
+inline constexpr float kTextSmall = 10.5f;
+inline constexpr float kTextBody = 11.0f;
+inline constexpr float kTextTitle = 12.0f; ///< also Spectral's popup-menu size
 
 void paintWell(juce::Graphics& graphics, juce::Rectangle<float> area);
 
@@ -26,6 +30,9 @@ class HolotonerLook final : public juce::LookAndFeel_V4 {
 public:
     HolotonerLook();
     void drawRotarySlider(juce::Graphics&,int,int,int,int,float,float,float,juce::Slider&) override;
+    void drawLinearSlider(juce::Graphics&,int,int,int,int,float,float,float,juce::Slider::SliderStyle,juce::Slider&) override;
+    int getSliderThumbRadius(juce::Slider&) override;
+    void drawToggleButton(juce::Graphics&,juce::ToggleButton&,bool highlighted,bool down) override;
 
     void drawButtonBackground(juce::Graphics&, juce::Button&, const juce::Colour&, bool highlighted, bool down) override;
     void drawComboBox(juce::Graphics&, int width, int height, bool down, int buttonX, int buttonY, int buttonWidth,
@@ -33,4 +40,5 @@ public:
     void positionComboBoxText(juce::ComboBox&, juce::Label&) override;
     juce::Font getComboBoxFont(juce::ComboBox&) override;
     juce::Font getTextButtonFont(juce::TextButton&, int buttonHeight) override;
+    juce::Font getPopupMenuFont() override;
 };

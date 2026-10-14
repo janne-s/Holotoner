@@ -1,3 +1,4 @@
+#include "core/image/ShapeGenerator.h"
 #include "plugin/Source/PluginProcessor.h"
 #include "plugin/Source/TextSource.h"
 #include <juce_audio_utils/juce_audio_utils.h>
@@ -39,6 +40,110 @@ public:
         return info;
     }
 };
+
+bool waitForImage(HolotonerProcessor& processor, const juce::String& name)
+{
+    for (int i = 0; i < 300; ++i) {
+        juce::Thread::sleep(10);
+        juce::Timer::callPendingTimersSynchronously();
+        if (const auto document = processor.imageDocument(); document != nullptr && document->name == name
+            && !processor.isLoadingImage() && processor.imageMask() != nullptr)
+            return true;
+    }
+    return false;
+}
+
+void smoothStateTests()
+{
+    auto processor = std::make_unique<HolotonerProcessor>();
+    auto restored = std::make_unique<HolotonerProcessor>();
+    set(*processor, "image_smooth", 0.0007f);
+    juce::MemoryBlock state;
+    processor->getStateInformation(state);
+    restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    check(std::abs(restored->state().getRawParameterValue("image_smooth")->load()-0.0007f)<1.0e-8f,
+          "Smooth milliseconds did not restore");
+    auto legacy = juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize()));
+    for (auto* child = legacy->getFirstChildElement(); child;) {
+        auto* next = child->getNextElement();
+        if (child->getStringAttribute("id") == "image_smooth") legacy->removeChildElement(child,true);
+        child = next;
+    }
+    juce::AudioProcessor::copyXmlToBinary(*legacy,state);
+    restored->setStateInformation(state.getData(),static_cast<int>(state.getSize()));
+    check(restored->state().getRawParameterValue("image_smooth")->load()==0.0f,
+          "Pre-Smooth state retained the running processor's Smooth");
+}
+
+void shapeSourceTests()
+{
+    HolotonerProcessor shape;
+    check(juce::roundToInt(shape.state().getRawParameterValue("shape_kind")->load()) == static_cast<int>(holotoner::ShapeKind::Smiley),
+          "default shape choice is not Smiley");
+    check(waitForImage(shape, "Smiley 3") && shape.shapeActive(), "default Smiley did not publish");
+    set(shape, "shape_kind", 4.0f); // Sierpinski
+    set(shape, "shape_order", 5.0f);
+    shape.useShape();
+    check(waitForImage(shape, "Sierpinski 5") && shape.shapeActive(), "shape source did not publish");
+    set(shape, "shape_order", 2.0f); // automation alone regenerates an active shape
+    check(waitForImage(shape, "Sierpinski 2"), "shape order change did not regenerate");
+    juce::MemoryBlock state;
+    shape.getStateInformation(state);
+    const auto xml = juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize()));
+    check(xml != nullptr && xml->getChildByName("Shape") != nullptr && xml->getChildByName("Image") == nullptr,
+          "shape state is not parametric");
+    HolotonerProcessor restored;
+    restored.setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    check(waitForImage(restored, "Sierpinski 2") && restored.shapeActive()
+              && restored.imageMask()->values == shape.imageMask()->values,
+          "shape did not restore identically");
+    set(restored, "shape_kind", static_cast<float>(holotoner::ShapeKind::Smiley));
+    check(waitForImage(restored, "Smiley 2"), "smiley choice did not generate");
+    juce::MemoryBlock smileyState;
+    restored.getStateInformation(smileyState);
+    auto smileyRestored = std::make_unique<HolotonerProcessor>();
+    smileyRestored->setStateInformation(smileyState.getData(), static_cast<int>(smileyState.getSize()));
+    check(waitForImage(*smileyRestored, "Smiley 2")
+              && smileyRestored->imageMask()->values == restored.imageMask()->values,
+          "smiley shape did not restore identically");
+    restored.setText("Hi");
+    for (int i = 0; i < 300 && (restored.isLoadingImage() || restored.text() != "Hi"); ++i) {
+        juce::Thread::sleep(10);
+        juce::Timer::callPendingTimersSynchronously();
+    }
+    check(!restored.shapeActive(), "text did not replace the shape source");
+
+    // Echo ♪: a quarter note at 120 BPM (no host tempo here) resolves to 0.5 s on the audio thread.
+    {
+        HolotonerProcessor synced;
+        set(synced, "space_echo_time_sync", 15.0f); // 1/4
+        synced.prepareToPlay(48000.0, 512);
+        juce::AudioBuffer<float> block(2, 512);
+        block.clear();
+        juce::MidiBuffer none;
+        synced.processBlock(block, none);
+        check(std::abs(synced.echoTimeSeconds() - 0.5) < 1.0e-6, "echo note did not resolve at the tempo");
+    }
+    // Diagnostic snapshots: a shape source with every Space cue on, plane moved left and turned.
+    set(shape, "position_x", -0.6f);
+    set(shape, "yaw", 35.0f);
+    for (const auto* id : {"space_interfere", "space_echo", "space_feedback", "space_resonate"}) set(shape, id, 0.8f);
+    set(shape, "pitch_rate_sync", 12.0f);       // 1/8: shows the compact note menus
+    set(shape, "space_echo_time_sync", 3.0f);   // 1/64T: the longest note name
+    shape.motionPanelOpen = true;
+    auto editor = std::unique_ptr<juce::AudioProcessorEditor>(shape.createEditor());
+    juce::PNGImageFormat png;
+    for (const auto& [name, small] : {std::pair {"/tmp/holotoner-space-editor.png", false},
+                                      std::pair {"/tmp/holotoner-space-small.png", true}}) {
+        if (small) editor->setSize(900, editor->getConstrainer()->getMinimumHeight());
+        juce::Thread::sleep(80);
+        juce::Timer::callPendingTimersSynchronously();
+        auto snapshot = editor->createComponentSnapshot(editor->getLocalBounds(), true, 1.0f);
+        juce::FileOutputStream output {juce::File(name)};
+        output.setPosition(0); output.truncate();
+        check(png.writeImageToStream(snapshot, output), "space snapshot failed");
+    }
+}
 
 void textAndMotionTests()
 {
@@ -301,15 +406,17 @@ void letterARegression()
     check(total>1000 && hits>total*8/10 && left>500 && right>500,"actual polar audio did not retain both legs of A");
     auto editor = std::unique_ptr<juce::AudioProcessorEditor>(processor.createEditor());
     const auto before = editor->getBounds();
-    std::function<void(juce::Component&,int&,bool&)> inspect = [&](juce::Component& c,int& count,bool& rotary) {
+    // Decision 19: the seven geometry axes are linear rows in the Motion panel; everything else is a knob.
+    std::function<void(juce::Component&,int&,int&,int&)> inspect = [&](juce::Component& c,int& knobs,int& rows,int& other) {
         if (auto* slider = dynamic_cast<juce::Slider*>(&c)) {
-            ++count; rotary = rotary && slider->getSliderStyle() == juce::Slider::RotaryHorizontalVerticalDrag;
+            const auto style = slider->getSliderStyle();
+            ++(style == juce::Slider::RotaryHorizontalVerticalDrag ? knobs : style == juce::Slider::LinearHorizontal ? rows : other);
         }
-        for (auto* child : c.getChildren()) inspect(*child,count,rotary);
+        for (auto* child : c.getChildren()) inspect(*child,knobs,rows,other);
     };
-    int knobs = 0; bool rotary = true;
-    inspect(*editor,knobs,rotary);
-    check(knobs>=22 && rotary,"image/audio controls were hidden or linear sliders remained");
+    int knobs = 0, rows = 0, other = 0;
+    inspect(*editor,knobs,rows,other);
+    check(knobs>=19 && rows==7 && other==0,"editor controls do not match the Motion-panel layout");
     for (auto* child : editor->getChildren())
         if (auto* button = dynamic_cast<juce::TextButton*>(child); button != nullptr && button->getButtonText()=="Text") {
             button->setToggleState(true,juce::dontSendNotification); button->onClick();
@@ -420,19 +527,28 @@ int main()
     juce::AudioBuffer<float> buffer(2, 512);
     juce::MidiBuffer midi;
     std::uint64_t position = 0;
-    const auto started = std::chrono::steady_clock::now();
-    for (int block = 0; block < 5625; ++block) {
-        for (int i = 0; i < 512; ++i) {
-            const auto value = static_cast<float>(0.2 * std::sin(2.0 * 3.141592653589793 * 440.0
-                                                               * static_cast<double>(position++) / 48000.0));
-            buffer.setSample(0, i, value);
-            buffer.setSample(1, i, value);
+    const auto measure = [&](const char* name) {
+        const auto started = std::chrono::steady_clock::now();
+        for (int block = 0; block < 5625; ++block) {
+            for (int i = 0; i < 512; ++i) {
+                const auto value = static_cast<float>(0.2 * std::sin(2.0 * 3.141592653589793 * 440.0
+                                                                   * static_cast<double>(position++) / 48000.0));
+                buffer.setSample(0, i, value);
+                buffer.setSample(1, i, value);
+            }
+            processor.processBlock(buffer, midi);
         }
-        processor.processBlock(buffer, midi);
-    }
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    std::cout << "60s native Phase map including sample history: " << elapsed << "s ("
-              << 100.0 * elapsed / 60.0 << "% of real-time budget)\n";
+        const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        std::cout << "60s native " << name << ": " << elapsed << "s ("
+                  << 100.0 * elapsed / 60.0 << "% of real-time budget)\n";
+    };
+    measure("Phase map including sample history");
+    set(processor, "image_smooth", 0.001f);
+    measure("Phase map with Smooth 1 ms");
+    set(processor, "image_smooth", 0.0f);
+    for (const auto* id : {"space_interfere", "space_echo", "space_feedback", "space_resonate"}) set(processor, id, 1.0f);
+    measure("Phase map with all Space cues at 100%");
+    for (const auto* id : {"space_interfere", "space_echo", "space_feedback", "space_resonate"}) set(processor, id, 0.0f);
     std::array<HolotonerProcessor::ScopeSample, 8192> samples {};
     const auto count = processor.scopeSamples(samples.data(), static_cast<int>(samples.size()));
     check(count == static_cast<int>(samples.size()), "actual scope history missing");
@@ -488,6 +604,8 @@ int main()
     juce::PNGImageFormat png;
     check(png.writeImageToStream(snapshot, output), "editor snapshot failed");
     textAndMotionTests();
+    shapeSourceTests();
+    smoothStateTests();
     letterARegression();
     return failures == 0 ? 0 : 1;
 }

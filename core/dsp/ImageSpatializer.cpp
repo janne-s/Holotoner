@@ -11,6 +11,12 @@ namespace {
 constexpr double kHighHz = 16000.0;
 constexpr double kTiny = 1.0e-12;
 constexpr double kRunaway = 16.0;
+// Edge 0 pulls within this width (radians); each Edge step widens it geometrically to
+// kAttraction * kAttractionSpan at 99%, and Edge 100% is the exact hard snap.
+constexpr double kAttraction = 0.2;
+constexpr double kAttractionSpan = 30.0;
+constexpr double kRestSide = 1.0;
+constexpr double kEchoLevel = 2.0; // Echo at 100%: delayed level relative to the direct sound // radians from mono where Rest +100% sends unheld samples
 
 float finiteOr(float value, float fallback) { return std::isfinite(value) ? value : fallback; }
 
@@ -31,6 +37,9 @@ void ImageSpatializer::prepare(double sampleRate)
         value *= scale;
     frameSmoothing_ = 1.0 - std::exp(-static_cast<double>(kHopSize) / (0.02 * sampleRate_));
     wetRate_ = static_cast<float>(1.0 - std::exp(-1.0 / (0.02 * sampleRate_)));
+    // Echo history: the longest echo plus interpolation, in hops at this rate. Allocated only here.
+    echoFrames_ = static_cast<std::size_t>(std::ceil(kEchoMaxSeconds * sampleRate_ / static_cast<double>(kHopSize))) + 3;
+    echoHistory_.assign(echoFrames_ * (kFftSize / 2) * 2, {});
     reset();
 }
 
@@ -49,14 +58,23 @@ void ImageSpatializer::reset()
     smoothedParameters_ = parameters_;
     inputAt_ = dryAt_ = outputAt_ = filled_ = sinceHop_ = 0;
     wetCurrent_ = parameters_.wet;
+    deltaCurrent_ = parameters_.delta ? 1.0f : 0.0f;
     safetyResets_ = 0;
     phaseControls_.fill({});
     phaseInitialized_ = false;
     fieldTime_ = 0.0;
     geometryBlend_ = 1.0f;
+    fieldRotationCurrent_ = 0.0;
+    fieldFollow_ = previousFieldFollow_ = parameters_.smooth > 0.0f
+        ? -std::expm1(-1.0 / (sampleRate_ * parameters_.smooth)) : 1.0;
     fieldHasSupport_ = false;
     supportValues_.fill(0);
+    softSupport_.fill(0);
     fieldAspectX_ = fieldAspectY_ = 1;
+    rowWeight_.fill(0); rowWeightTarget_.fill(0);
+    std::fill(echoHistory_.begin(), echoHistory_.end(), std::complex<float> {});
+    echoAt_ = 0; echoLive_ = false;
+    ringLeft_.fill({}); ringRight_.fill({}); ringLive_ = false;
     imagePlane_ = previousImagePlane_ = projectPlane(parameters_.plane);
     for (int y = 0; y < kImageMaskHeight; ++y)
         for (int x = 0; x < kImageMaskWidth; ++x)
@@ -76,7 +94,14 @@ void ImageSpatializer::setParameters(Parameters parameters)
     plane.yawDegrees = std::clamp(finiteOr(plane.yawDegrees, 0.0f), -180.0f, 180.0f);
     plane.rollDegrees = std::clamp(finiteOr(plane.rollDegrees, 0.0f), -180.0f, 180.0f);
     parameters.imageAmount = std::clamp(finiteOr(parameters.imageAmount, 1.0f), 0.0f, 1.0f);
+    parameters.edge = std::clamp(finiteOr(parameters.edge, 1.0f), 0.0f, 1.0f);
+    parameters.smooth = std::clamp(finiteOr(parameters.smooth, 0.0f), 0.0f, 0.005f);
+    parameters.rest = std::clamp(finiteOr(parameters.rest, 0.0f), -1.0f, 1.0f);
     parameters.wet = std::clamp(finiteOr(parameters.wet, 1.0f), 0.0f, 1.0f);
+    for (auto* amount : {&parameters.interfere, &parameters.feedback, &parameters.echo, &parameters.resonate})
+        *amount = std::clamp(finiteOr(*amount, 0.0f), 0.0f, 1.0f);
+    parameters.echoTime = std::clamp(finiteOr(parameters.echoTime, 0.25f), static_cast<float>(kEchoMinSeconds),
+                                     static_cast<float>(kEchoMaxSeconds));
     parameters.phaseProjection = parameters.phaseProjection == PhaseProjection::Polar
         ? PhaseProjection::Polar : PhaseProjection::Cartesian;
     parameters_ = parameters;
@@ -116,9 +141,11 @@ void ImageSpatializer::process(float* left, float* right, int sampleCount, const
         outputRight_[read] = 0.0;
         constrainField(wetLeft, wetRight);
         wetCurrent_ += (parameters_.wet - wetCurrent_) * wetRate_;
-        const auto outLeft = static_cast<double>(delayedLeft) + static_cast<double>(wetCurrent_)
+        deltaCurrent_ += ((parameters_.delta ? 1.0f : 0.0f) - deltaCurrent_) * wetRate_;
+        const auto dryGain = 1.0 - static_cast<double>(deltaCurrent_);
+        const auto outLeft = dryGain * static_cast<double>(delayedLeft) + static_cast<double>(wetCurrent_)
             * (wetLeft - static_cast<double>(delayedLeft));
-        const auto outRight = static_cast<double>(delayedRight) + static_cast<double>(wetCurrent_)
+        const auto outRight = dryGain * static_cast<double>(delayedRight) + static_cast<double>(wetCurrent_)
             * (wetRight - static_cast<double>(delayedRight));
         if (std::isfinite(outLeft) && std::isfinite(outRight)
             && std::abs(outLeft) <= kRunaway && std::abs(outRight) <= kRunaway) {
@@ -140,6 +167,21 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
     phaseTransform.scaleX *= targetMask_.aspectX;
     phaseTransform.scaleY *= targetMask_.aspectY;
     buildPhaseControls(projectPlane(phaseTransform));
+    const SpaceAmounts space {smoothedParameters_.interfere, smoothedParameters_.feedback,
+                              smoothedParameters_.echo, smoothedParameters_.resonate, smoothedParameters_.echoTime};
+    const bool spaced = spaceActive(space);
+    // Effects switched off drop their memory, so switching on never releases stale sound.
+    if (space.echo <= 1.0e-6 && echoLive_) {
+        std::fill(echoHistory_.begin(), echoHistory_.end(), std::complex<float> {});
+        echoLive_ = false;
+    }
+    if (space.resonate <= 1.0e-6 && ringLive_) {
+        ringLeft_.fill({}); ringRight_.fill({});
+        ringLive_ = false;
+    }
+    const auto rings = space.resonate > 1.0e-6 ? resonators(imagePlane_, rowWeight_) : Resonators {};
+    if (space.echo > 1.0e-6) { echoAt_ = (echoAt_ + 1) % echoFrames_; echoLive_ = true; }
+    ringLive_ = ringLive_ || space.resonate > 1.0e-6;
     for (std::size_t i = 0; i < kFftSize; ++i) {
         const auto at = (inputAt_ + i) % kFftSize;
         spectrum_[i] = {static_cast<double>(inputLeft_[at]) * window_[i],
@@ -160,6 +202,8 @@ void ImageSpatializer::renderFrame(const ImageMask* mask)
         std::complex<double> outLeft, outRight;
         spatialize(inLeft, inRight, signedWidth, basePosition, outLeft, outRight);
         applyPhase(k, inLeft, inRight, signedWidth, outLeft, outRight);
+        if (spaced)
+            applyEffects(k, space, rings, outLeft, outRight);
         spectrum_[k] = outLeft + imaginary * outRight;
         spectrum_[kFftSize - k] = std::conj(outLeft) + imaginary * std::conj(outRight);
     }
@@ -190,8 +234,23 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
         if (targetMask_.hasNearestSupport) {
             fieldHasSupport_ = true;
             supportValues_ = targetMask_.values;
+            // Once per mask change, not per sample: each pixel takes its neighbours' support
+            // fading to zero 3 px away, so the soft field has no edge to jump at.
+            for (int y = 0; y < kImageMaskHeight; ++y)
+                for (int x = 0; x < kImageMaskWidth; ++x) {
+                    float strongest = 0.0f;
+                    for (int dy = -2; dy <= 2; ++dy)
+                        for (int dx = -2; dx <= 2; ++dx) {
+                            const auto px = x+dx, py = y+dy;
+                            if (px < 0 || py < 0 || px >= kImageMaskWidth || py >= kImageMaskHeight) continue;
+                            const auto falloff = 1.0f-std::sqrt(static_cast<float>(dx*dx+dy*dy))/3.0f;
+                            strongest = std::max(strongest, falloff*supportValues_[static_cast<std::size_t>(py*kImageMaskWidth+px)]);
+                        }
+                    softSupport_[static_cast<std::size_t>(y*kImageMaskWidth+x)] = strongest;
+                }
             fieldAspectX_ = targetMask_.aspectX; fieldAspectY_ = targetMask_.aspectY;
         }
+        rowWeightTarget_ = spaceRowWeights(targetMask_);
     }
     const auto smooth = [this](auto& current, const auto target) {
         using Value = std::remove_reference_t<decltype(current)>;
@@ -211,6 +270,19 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     smoothAngle(currentPlane.yawDegrees, targetPlane.yawDegrees);
     smoothAngle(currentPlane.rollDegrees, targetPlane.rollDegrees);
     smooth(smoothedParameters_.imageAmount, parameters_.imageAmount);
+    smooth(smoothedParameters_.edge, parameters_.edge);
+    smooth(smoothedParameters_.smooth, parameters_.smooth);
+    previousFieldFollow_ = fieldFollow_;
+    fieldFollow_ = smoothedParameters_.smooth > 0.0f
+        ? -std::expm1(-1.0 / (sampleRate_ * smoothedParameters_.smooth)) : 1.0;
+    smooth(smoothedParameters_.rest, parameters_.rest);
+    smooth(smoothedParameters_.interfere, parameters_.interfere);
+    smooth(smoothedParameters_.feedback, parameters_.feedback);
+    smooth(smoothedParameters_.echo, parameters_.echo);
+    smooth(smoothedParameters_.resonate, parameters_.resonate);
+    smooth(smoothedParameters_.echoTime, parameters_.echoTime);
+    for (std::size_t y = 0; y < rowWeight_.size(); ++y)
+        smooth(rowWeight_[y], rowWeightTarget_[y]);
     geometryBlend_ = 0.0f;
     smooth(maskPresence_, targetMaskPresence_);
     previousNearest_ = nearest_;
@@ -226,7 +298,7 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     imagePlane_ = projectPlane(imageTransform);
 }
 
-void ImageSpatializer::constrainField(double& left, double& right)
+double ImageSpatializer::fieldRotation(double left, double right)
 {
     const auto mid = 0.5*(left+right), side = 0.5*(right-left);
     const auto level = std::hypot(mid, side);
@@ -235,7 +307,7 @@ void ImageSpatializer::constrainField(double& left, double& right)
         + geometryBlend_*(imagePlane_.signedFacing-previousImagePlane_.signedFacing);
     const auto amount = maskPresence_*smoothedParameters_.imageAmount*std::abs(facing);
     if (level < 1.0e-9 || amount < 1.0e-6 || !fieldHasSupport_)
-        return;
+        return 0.0;
     const auto polarity = mid >= 0.0 ? 1.0 : -1.0;
     const auto angle = std::atan2(polarity*side, std::abs(mid));
     // Same calibrated level axis as the measured +14 dB scope. No audio gain is applied.
@@ -250,7 +322,7 @@ void ImageSpatializer::constrainField(double& left, double& right)
     const auto bx = b.stereo-a.stereo, by = b.frequency-a.frequency;
     const auto dx = d.stereo-a.stereo, dy = d.frequency-a.frequency;
     const auto determinant = static_cast<double>(bx*dy-by*dx);
-    if (std::abs(determinant) < 1.0e-7) return;
+    if (std::abs(determinant) < 1.0e-7) return 0.0;
     const auto imageCoordinates = [&](double direction) {
         const auto x = parameters_.phaseProjection == PhaseProjection::Cartesian
             ? 2*radius*std::sin(direction) : direction*4/std::numbers::pi;
@@ -259,12 +331,12 @@ void ImageSpatializer::constrainField(double& left, double& right)
         return ImageMask::PhasePoint {static_cast<float>(63*((x-a.stereo)*dy-(y-a.frequency)*dx)/determinant),
             static_cast<float>(63*(1-(bx*(y-a.frequency)-by*(x-a.stereo))/determinant))};
     };
-    auto targetAngle = angle;
-    bool supported = false;
-    for (int attempt = 0; attempt < 2 && !supported; ++attempt) {
-        targetAngle = attempt == 0 ? angle : -std::copysign(0.8,angle);
-        // Alternating projection: image support, then the original sample's radius.
-        // Only query an immutable image-coordinate map; no rasterization/field compilation here.
+    // One search from a start angle: image support, then the original sample's radius.
+    // Only queries immutable image-coordinate maps; no rasterization/field compilation here.
+    struct Solution { double angle = 0; bool hard = false; double soft = 0; };
+    const auto solve = [&](double start) {
+        Solution solution {start, false, 0.0};
+        auto targetAngle = start;
         for (int iteration = 0; iteration < 16; ++iteration) {
             const auto query = imageCoordinates(targetAngle);
             const auto px = std::clamp(query.x,0.0f,63.0f), py = std::clamp(query.y,0.0f,63.0f);
@@ -289,21 +361,77 @@ void ImageSpatializer::constrainField(double& left, double& right)
             } else targetAngle = std::clamp(static_cast<double>(worldX)*std::numbers::pi/4,-0.5*std::numbers::pi,0.5*std::numbers::pi);
             if (std::abs(targetAngle-previousAngle) < 1.0e-5) break;
         }
+        solution.angle = targetAngle;
         const auto finalPoint = imageCoordinates(targetAngle);
         if (!std::isfinite(finalPoint.x) || !std::isfinite(finalPoint.y)
-            || finalPoint.x < -2 || finalPoint.x > 65 || finalPoint.y < -2 || finalPoint.y > 65) continue;
+            || finalPoint.x < -2 || finalPoint.x > 65 || finalPoint.y < -2 || finalPoint.y > 65) return solution;
         const auto fx = static_cast<int>(std::lround(finalPoint.x)), fy = static_cast<int>(std::lround(finalPoint.y));
         for (int y = -2; y <= 2; ++y)
             for (int x = -2; x <= 2; ++x) {
                 const auto px = fx+x,py = fy+y;
                 if (px>=0 && px<64 && py>=0 && py<64)
-                    supported = supported || supportValues_[static_cast<std::size_t>(py*64+px)]>0.001f;
+                    solution.hard = solution.hard || supportValues_[static_cast<std::size_t>(py*64+px)]>0.001f;
             }
+        // Soft support: bilinear in the softened map, fading out over 3 px beyond the bitmap.
+        const auto cx = std::clamp(finalPoint.x,0.0f,63.0f), cy = std::clamp(finalPoint.y,0.0f,63.0f);
+        const auto outside = std::hypot(finalPoint.x-cx, finalPoint.y-cy);
+        const auto ix = std::min(static_cast<int>(cx),62), iy = std::min(static_cast<int>(cy),62);
+        const auto tx = cx-static_cast<float>(ix), ty = cy-static_cast<float>(iy);
+        const auto at = [this](int x,int y) { return softSupport_[static_cast<std::size_t>(y*64+x)]; };
+        const auto value = (at(ix,iy)*(1-tx)+at(ix+1,iy)*tx)*(1-ty)+(at(ix,iy+1)*(1-tx)+at(ix+1,iy+1)*tx)*ty;
+        solution.soft = std::clamp(3.0*static_cast<double>(value)*std::max(0.0,1.0-static_cast<double>(outside)/3.0),0.0,1.0);
+        return solution;
+    };
+    const auto first = solve(angle);
+    const auto edge = static_cast<double>(smoothedParameters_.edge);
+    // Fallback start for samples whose own direction finds no support.
+    const auto needFallback = !first.hard || edge < 1.0;
+    const auto second = needFallback ? solve(-std::copysign(0.8,angle)) : Solution {};
+    const auto hard = first.hard ? first.angle-angle : second.hard ? second.angle-angle : 0.0;
+    // Soft: attraction fades with the distance moved, so a sample between two strokes is
+    // barely moved instead of jumping from one stroke's angle to the other's.
+    const auto width = kAttraction*std::pow(kAttractionSpan, edge);
+    // Support also hardens with Edge, so the soft map's halo shrinks toward the hard one.
+    const auto pull = [width,edge](const Solution& solution, double from) {
+        const auto moved = (solution.angle-from)/width;
+        const auto support = edge*(solution.hard ? 1.0 : 0.0) + (1.0-edge)*solution.soft;
+        return support*std::exp(-moved*moved);
+    };
+    const auto pullFirst = pull(first, angle), pullSecond = pull(second, angle);
+    const auto soft = pullFirst*(first.angle-angle) + (1.0-pullFirst)*pullSecond*(second.angle-angle);
+    auto offset = edge >= 1.0 ? hard : soft;
+    // Rest steers what the image cannot hold (no support at this level) toward the centre
+    // or the sides, by how little the image holds it. Level is never invented or removed.
+    const auto rest = static_cast<double>(smoothedParameters_.rest);
+    if (std::abs(rest) > 1.0e-6) {
+        const auto held = edge >= 1.0 ? (first.hard || second.hard ? 1.0 : 0.0)
+                                      : std::clamp(pullFirst+(1.0-pullFirst)*pullSecond, 0.0, 1.0);
+        // Sideways is continuous through mono (no jump between the two sides).
+        const auto target = rest < 0.0 ? 0.0 : kRestSide*std::tanh(angle/0.15);
+        offset += std::abs(rest)*(1.0-held)*(target-angle);
     }
-    if (!supported) return; // No support at this radius: never invent level to fill the image.
+    if (std::abs(offset) < 1.0e-12) return 0.0; // nothing to hold or steer
     // Avoid a waveform discontinuity at Polar Sample's polarity-fold seam.
     const auto seam = std::min(1.0, std::abs(mid)/(0.05*level));
-    const auto rotation = amount*seam*(targetAngle-angle);
+    return amount*seam*offset;
+}
+
+void ImageSpatializer::constrainField(double& left, double& right)
+{
+    auto rotation = fieldRotation(left, right);
+    const auto follow = previousFieldFollow_ + geometryBlend_ * (fieldFollow_ - previousFieldFollow_);
+    if (follow < 1.0) {
+        // Interpolate on the unit circle, including across the +/-pi seam.
+        // Only steering is smoothed: no source-waveform filtering or gain crossfade.
+        fieldRotationCurrent_ = std::remainder(fieldRotationCurrent_
+            + follow * std::remainder(rotation - fieldRotationCurrent_, 2.0 * std::numbers::pi),
+            2.0 * std::numbers::pi);
+        rotation = fieldRotationCurrent_;
+    } else {
+        fieldRotationCurrent_ = rotation; // zero Smooth follows the original path exactly
+    }
+    if (std::abs(rotation) < 1.0e-12) return;
+    const auto mid = 0.5*(left+right), side = 0.5*(right-left);
     const auto c = std::cos(rotation), s = std::sin(rotation);
     // Rotate the EXISTING sample vector: L²+R² is unchanged at every sample.
     // No pixel-derived amplitude, envelope, sign-only carrier or silent-row gating.
@@ -389,6 +517,55 @@ void ImageSpatializer::spatialize(std::complex<double> left, std::complex<double
     gainRight /= normalization;
     outputLeft = mid*gainLeft + signedWidth*side;
     outputRight = mid*gainRight - signedWidth*side;
+}
+
+void ImageSpatializer::applyEffects(std::size_t bin, const SpaceAmounts& amounts, const Resonators& rings,
+                                    std::complex<double>& left, std::complex<double>& right)
+{
+    const auto hz = static_cast<double>(bin) * sampleRate_ / static_cast<double>(kFftSize);
+    if (amounts.interfere > 1.0e-6) {
+        const auto response = interfereResponse(imagePlane_, amounts, hz);
+        left *= response.left;
+        right *= response.right;
+    }
+    if (amounts.resonate > 1.0e-6) {
+        // y = x + g·advance·y[previous hop]: a bin-centred partial is reinforced and rings on
+        // (about 2.3 s at the centre of a resonance). The added part is scaled by (1 − g),
+        // so a steady partial gains at most kResonanceBoost: bounded by construction.
+        const auto peak = resonance(rings, hz);
+        if (peak > 1.0e-4) {
+            const auto ring = kResonanceFeedback * peak;
+            const auto advance = std::polar(ring, 2.0 * std::numbers::pi * static_cast<double>(bin * kHopSize)
+                                                  / static_cast<double>(kFftSize));
+            ringLeft_[bin] = left + advance * ringLeft_[bin];
+            ringRight_[bin] = right + advance * ringRight_[bin];
+            const auto mix = amounts.resonate * kResonanceBoost * peak * (1.0 - ring);
+            left += mix * ringLeft_[bin];
+            right += mix * ringRight_[bin];
+        } else ringLeft_[bin] = ringRight_[bin] = {};
+    }
+    if (amounts.echo > 1.0e-6) {
+        // Spectral delay: this bin's own echo time from its row's distance, read between two
+        // frames; the image's bright rows echo loudest. Repeats ≤ kMaxFeedback: bounded.
+        const auto frames = std::clamp(echoSeconds(imagePlane_, hz, amounts.echoTime) * sampleRate_ / static_cast<double>(kHopSize),
+                                       1.0, static_cast<double>(echoFrames_ - 2));
+        const auto whole = static_cast<std::size_t>(frames);
+        const auto fraction = static_cast<float>(frames - static_cast<double>(whole));
+        const auto half = kFftSize / 2;
+        const auto slot = [&](std::size_t back) { return (((echoAt_ + echoFrames_ - back) % echoFrames_) * half + bin) * 2; };
+        const auto a = slot(whole), b = slot(whole + 1);
+        const auto delayedLeft = (1.0f - fraction) * echoHistory_[a] + fraction * echoHistory_[b];
+        const auto delayedRight = (1.0f - fraction) * echoHistory_[a + 1] + fraction * echoHistory_[b + 1];
+        const auto repeats = static_cast<float>(kMaxFeedback * amounts.feedback);
+        const auto write = slot(0);
+        echoHistory_[write] = std::complex<float>(left) + repeats * delayedLeft;
+        echoHistory_[write + 1] = std::complex<float>(right) + repeats * delayedRight;
+        // Echo 100% gives twice the delayed level (it was too quiet beside the direct sound).
+        const auto weight = maskPresence_ > 0.5 ? 0.3 + 0.7 * spaceRowWeight(rowWeight_, hz) : 1.0;
+        const auto mix = kEchoLevel * amounts.echo * weight * (1.0 - 0.5 * static_cast<double>(repeats));
+        left += mix * std::complex<double>(delayedLeft);
+        right += mix * std::complex<double>(delayedRight);
+    }
 }
 
 std::uint32_t ImageSpatializer::takeSafetyResets()

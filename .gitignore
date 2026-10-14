@@ -6,3 +6,5 @@ CMakeUserPresets.json
 compile_commands.json
 *.jucer
 *.log
+
+/web/assets/source.tar.gz

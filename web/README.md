@@ -1,47 +1,48 @@
-# Holotoner Web Wrapper
+# Holotoner Web
 
-This directory will contain the production browser wrapper around
-`holotoner_core`. It is intentionally documentation-only until the shared
-image-driven DSP contract has been validated through native listening; there
-will be no separate JavaScript audio implementation to drift away from the
-native product. The shared core already contains the deterministic image mask,
-plane projection, image-constrained moving phase field, actual L/R scope
-mapping and fixed-latency spatializer intended for the WebAssembly
-build.
+The browser version of [Holotoner](../README.md). Play the demo or load local
+audio. Images and session files stay on your device.
 
-The accepted boundary is:
+## Run locally
 
-- JavaScript owns file selection, responsive UI and rendering.
-- A worker or the main UI thread decodes images to straight-alpha RGBA away
-  from audio rendering; the shared C++ core builds the same fixed-size mask as
-  the native wrapper.
-- AudioWorklet owns real-time audio scheduling.
-- The C++20 core is compiled to WebAssembly and performs the same geometry and
-  DSP as the native formats.
-- Phase map uses bounded spectral phase drift and an off-thread projected
-  image steering field. The image stage rotates existing sample pairs without
-  changing their combined energy; it is nonlinear and may colour the sound.
-  Compile the immutable nearest-support map in image coordinates off the audio
-  thread. Query it through continuous audio-driven geometry; do not recompile
-  poses or use an animation-frame timer to drive modulation.
-  This is the only engine: no mode selector or retired spectral paths.
-  Polar renders actual input/output samples only, with no target-image overlay.
-  XY rectangle, Polar warp, processed-mask preview, threshold and B/W must
-  retain the native semantics; the analyser must measure actual L/R samples.
-- User-selected images and audio remain local.
-- Match native Text/Motion semantics: rasterized text is an image source,
-  with Whole, grapheme-cluster Characters and whitespace-delimited Words.
-  Store rendered frames with text metadata, never depend on the original font
-  for reopening. Use proper Unicode grapheme segmentation in the browser.
-  Motion is additive to base geometry. ♪ uses the shared note/PPQ beat table;
-  the browser's local transport owns its audio-sample beat clock. Prepare
-  immutable image-coordinate support maps away from AudioWorklet. Each
-  geometry axis has an independent rate/♪ clock; preserve the native rotary,
-  image-left/audio-right layout and non-resizing text overlay. Budget frame memory
-  explicitly for mobile before implementing this wrapper.
-- GitHub Pages deployment must work from a project subpath and expose a visible
-  link to corresponding source.
+From the repository root:
 
-The first web production release includes a redistributable Holotoner demo loop
-and local audio-file selection. Camera and microphone input are later complete
-features, not hidden dependencies of the initial workflow.
+```sh
+python3 -m http.server 8000
+```
+
+Open [localhost:8000/web/](http://localhost:8000/web/). The WASM engine is included.
+Use HTTPS when hosting elsewhere.
+
+## Build
+
+Activate Emscripten 4.0.22, then run:
+
+```sh
+./web/build.sh
+```
+
+The browser uses AudioWorklet and the shared C++ engine. No npm install or
+Node.js runtime is needed.
+
+## GitHub Pages
+
+Set Settings → Pages → Source to **GitHub Actions**. The Pages workflow builds,
+tests and deploys `web/` when `main` or `master` changes.
+
+## Tests
+
+```sh
+node web/tests/engine.mjs
+```
+
+For browser checks, serve the app on port 8765 and start a separate Chrome with
+`--headless=new --mute-audio --remote-debugging-port=9236`, then run:
+
+```sh
+node web/tests/browser.mjs
+```
+
+## License
+
+[AGPL-3.0-only](../LICENSE). [Third-party notices](THIRD_PARTY.md).

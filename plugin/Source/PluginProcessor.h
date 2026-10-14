@@ -87,8 +87,15 @@ public:
 
     void loadImageFile(const juce::File& file);
     void setText(const juce::String& text);
+    /** Generated source: Shape Kind/Order parameters, regenerated off-thread when they change. */
+    void useShape();
+    bool shapeActive() const;
     juce::String text() const;
     int textFrameCount() const;
+    /** Editor view state only, not saved: whether the Motion panel is open. */
+    bool motionPanelOpen = false;
+    /** Echo Time as the audio thread last resolved it (♪ at the host tempo), seconds. */
+    double echoTimeSeconds() const { return resolvedEchoTime_.load(std::memory_order_relaxed); }
     std::shared_ptr<const ImageDocument> imageDocument() const;
     std::shared_ptr<const holotoner::ImageMask> imageMask() const;
     bool isLoadingImage() const { return imageLoadsPending_.load() > 0 || bankPending_.load()
@@ -120,6 +127,19 @@ private:
     std::atomic<float>* imageNormalize_ = nullptr;
     std::atomic<float>* imageInvert_ = nullptr;
     std::atomic<float>* imageAmount_ = nullptr;
+    std::atomic<float>* spaceFeedback_ = nullptr;
+    std::atomic<float>* spaceEcho_ = nullptr;
+    std::atomic<float>* spaceResonate_ = nullptr;
+    std::atomic<float>* spaceInterfere_ = nullptr;
+    std::atomic<float>* imageEdge_ = nullptr;
+    std::atomic<float>* imageSmooth_ = nullptr;
+    std::atomic<float>* imageRest_ = nullptr;
+    std::atomic<float>* outDelta_ = nullptr;
+    std::atomic<float>* echoTime_ = nullptr;
+    std::atomic<float>* echoSync_ = nullptr;
+    std::atomic<float> resolvedEchoTime_ {0.25f};
+    std::atomic<float>* shapeKind_ = nullptr;
+    std::atomic<float>* shapeOrder_ = nullptr;
     std::atomic<float>* imageProjection_ = nullptr;
     std::atomic<float>* imageThreshold_ = nullptr;
     std::atomic<float>* imageBinary_ = nullptr;
@@ -166,6 +186,9 @@ private:
     mutable std::mutex imageMutex_;
     std::shared_ptr<const ImageDocument> image_;
     juce::String text_;
+    bool shapeActive_ = false;   ///< guarded by imageMutex_
+    int renderedShape_ = -1;     ///< kind * 16 + order of the published shape; guarded by imageMutex_
+    int shapeKey() const;
     int renderedTextLayout_ = -1;
     int rejectedTextLayout_ = -1;
     std::vector<std::shared_ptr<const ImageDocument>> textFrames_;

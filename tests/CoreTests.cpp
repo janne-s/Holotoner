@@ -1,10 +1,12 @@
 #include "core/audio/SharedExchange.h"
 #include "core/audio/SourcePlayer.h"
+#include "core/dsp/Fft.h"
 #include "core/dsp/ImageSpatializer.h"
 #include "core/dsp/StereoWidth.h"
 #include "core/geometry/PlaneProjection.h"
 #include "core/geometry/Motion.h"
 #include "core/image/ImageMask.h"
+#include "core/image/ShapeGenerator.h"
 
 #include <algorithm>
 #include <array>
@@ -13,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <string_view>
+#include <vector>
 
 namespace {
 
@@ -646,6 +649,383 @@ void imageFieldMeasuredSupport(double sampleRate)
 
 } // namespace
 
+holotoner::ImageMask whiteFixture()
+{
+    holotoner::RgbaImage image;
+    image.width = image.height = 64;
+    image.pixels.assign(64 * 64 * 4, 255);
+    holotoner::ImageMaskSettings settings;
+    settings.channel = holotoner::PixelChannel::Luma;
+    return holotoner::buildImageMask(image, settings);
+}
+
+struct SpaceRun { double left = 0, right = 0, mono = 0; bool bounded = true; };
+
+// Space alone (Image Amount 0): measured after the 2048-sample latency has settled.
+SpaceRun runSpace(double sampleRate, holotoner::ImageSpatializer::Parameters parameters,
+                  const holotoner::ImageMask* mask, double hz, int blockSize = 512)
+{
+    constexpr std::size_t count = 32768;
+    std::vector<float> left(count), right(count);
+    std::uint32_t seed = 12345;
+    for (std::size_t i = 0; i < count; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        const auto noise = static_cast<float>(seed >> 8) / 16777216.0f - 0.5f;
+        left[i] = right[i] = hz > 0 ? static_cast<float>(0.2 * std::sin(2.0 * 3.141592653589793 * hz
+                                                         * static_cast<double>(i) / sampleRate))
+                                    : 0.4f * noise;
+    }
+    holotoner::ImageSpatializer engine;
+    parameters.imageAmount = 0.0f;
+    engine.setParameters(parameters);
+    engine.prepare(sampleRate);
+    for (std::size_t at = 0; at < count; at += static_cast<std::size_t>(blockSize)) {
+        const auto length = std::min(count - at, static_cast<std::size_t>(blockSize));
+        engine.process(left.data() + at, right.data() + at, static_cast<int>(length), mask);
+    }
+    SpaceRun run;
+    for (std::size_t i = 8192; i < count; ++i) {
+        run.bounded = run.bounded && std::isfinite(left[i]) && std::isfinite(right[i])
+            && std::abs(left[i]) < 2.0f && std::abs(right[i]) < 2.0f;
+        run.left += static_cast<double>(left[i]) * left[i];
+        run.right += static_cast<double>(right[i]) * right[i];
+        run.mono += std::pow(0.5 * (static_cast<double>(left[i]) + right[i]), 2.0);
+    }
+    return run;
+}
+
+// Processes a mono input through Space alone (Image Amount 0); output is latency-compensated.
+std::pair<std::vector<float>, std::vector<float>> runEffects(double sampleRate, holotoner::ImageSpatializer::Parameters parameters,
+                                                             const holotoner::ImageMask* mask, const std::vector<float>& input)
+{
+    holotoner::ImageSpatializer engine;
+    parameters.imageAmount = 0.0f;
+    engine.setParameters(parameters);
+    engine.prepare(sampleRate);
+    const auto latency = static_cast<std::size_t>(engine.latencySamples());
+    std::vector<float> left(input), right(input);
+    left.resize(input.size() + latency, 0.0f);
+    right.resize(input.size() + latency, 0.0f);
+    for (std::size_t at = 0; at < left.size(); at += 512) {
+        const auto length = std::min<std::size_t>(512, left.size() - at);
+        engine.process(left.data() + at, right.data() + at, static_cast<int>(length), mask);
+    }
+    left.erase(left.begin(), left.begin() + static_cast<std::ptrdiff_t>(latency));
+    right.erase(right.begin(), right.begin() + static_cast<std::ptrdiff_t>(latency));
+    return {left, right};
+}
+
+std::vector<float> toneBurst(double sampleRate, double hz, double seconds, double total)
+{
+    std::vector<float> tone(static_cast<std::size_t>(total * sampleRate));
+    for (std::size_t i = 0; i < static_cast<std::size_t>(seconds * sampleRate); ++i) {
+        const auto t = static_cast<double>(i) / sampleRate;
+        const auto fade = std::min({1.0, t / 0.005, (seconds - t) / 0.005});
+        tone[i] = static_cast<float>(0.3 * fade * std::sin(2.0 * 3.141592653589793 * hz * t));
+    }
+    return tone;
+}
+
+double energyBetween(const std::vector<float>& signal, double sampleRate, double from, double to)
+{
+    double energy = 0.0;
+    const auto end = std::min(signal.size(), static_cast<std::size_t>(to * sampleRate));
+    for (auto i = static_cast<std::size_t>(from * sampleRate); i < end; ++i) energy += static_cast<double>(signal[i]) * signal[i];
+    return energy;
+}
+
+// Time of the loudest 10 ms after `after` seconds.
+double loudestAfter(const std::vector<float>& signal, double sampleRate, double after)
+{
+    double best = 0.0, at = 0.0;
+    const auto step = 0.01;
+    for (double t = after; t + step < static_cast<double>(signal.size()) / sampleRate; t += step) {
+        const auto energy = energyBetween(signal, sampleRate, t, t + step);
+        if (energy > best) { best = energy; at = t; }
+    }
+    return at;
+}
+
+void spaceEffects(double sampleRate)
+{
+    holotoner::ImageSpatializer::Parameters base;
+    // Echo: a 60 ms burst returns after its row's distance time (about 250 ms at rest).
+    auto echo = base;
+    echo.echo = 1.0f;
+    const auto burst = toneBurst(sampleRate, 1000.0, 0.06, 1.2);
+    const auto dry = runEffects(sampleRate, base, nullptr, burst).first;
+    const auto wet = runEffects(sampleRate, echo, nullptr, burst).first;
+    const auto arrival = loudestAfter(wet, sampleRate, 0.12);
+    if (!(energyBetween(wet, sampleRate, 0.15, 0.6) > 0.05 * energyBetween(dry, sampleRate, 0.0, 0.1)
+          && energyBetween(dry, sampleRate, 0.15, 0.6) < 1.0e-6 && arrival > 0.2 && arrival < 0.35)) {
+        std::cerr << "echo did not return after the plane's distance time (" << arrival << " s)\n";
+        ++failures;
+    }
+    // Time sets the echo at the plane centre.
+    auto later = echo;
+    later.echoTime = 0.5f;
+    const auto laterArrival = loudestAfter(runEffects(sampleRate, later, nullptr, burst).first, sampleRate, 0.12);
+    if (!(laterArrival > 0.45 && laterArrival < 0.6)) {
+        std::cerr << "echo Time did not move the echo (" << laterArrival << " s)\n";
+        ++failures;
+    }
+    // Tilt: the top (highs) comes near and echoes sooner than the bottom (lows).
+    auto tilted = echo;
+    tilted.plane.pitchDegrees = 45.0f;
+    const auto high = loudestAfter(runEffects(sampleRate, tilted, nullptr, toneBurst(sampleRate, 7040.0, 0.06, 1.2)).first, sampleRate, 0.1);
+    const auto low = loudestAfter(runEffects(sampleRate, tilted, nullptr, toneBurst(sampleRate, 150.0, 0.06, 1.2)).first, sampleRate, 0.1);
+    if (!(high + 0.1 < low)) {
+        std::cerr << "echo time did not follow plane depth: high " << high << " s, low " << low << " s\n";
+        ++failures;
+    }
+    // Feedback repeats the echo and stays bounded.
+    auto repeating = echo;
+    repeating.feedback = 1.0f;
+    const auto repeats = runEffects(sampleRate, repeating, nullptr, burst).first;
+    float peak = 0.0f;
+    for (const auto value : repeats) peak = std::max(peak, std::abs(value));
+    if (!(energyBetween(repeats, sampleRate, 0.4, 1.2) > 2.0 * energyBetween(wet, sampleRate, 0.4, 1.2) && peak < 1.0f)) {
+        std::cerr << "echo feedback did not repeat, or was unbounded (peak " << peak << ")\n";
+        ++failures;
+    }
+    // Resonate: a tone on a bright row rings on after it stops; without Resonate it does not.
+    const auto white = whiteFixture();
+    auto ringing = base;
+    ringing.resonate = 1.0f;
+    const auto rings = holotoner::resonators(holotoner::projectPlane(ringing.plane), holotoner::spaceRowWeights(white));
+    const auto on = rings.hz[static_cast<std::size_t>(rings.count / 2)];
+    const auto tone = toneBurst(sampleRate, on, 0.4, 1.2);
+    const auto plainTone = runEffects(sampleRate, base, &white, tone).first;
+    const auto rung = runEffects(sampleRate, ringing, &white, tone).first;
+    float ringPeak = 0.0f;
+    for (const auto value : rung) ringPeak = std::max(ringPeak, std::abs(value));
+    const auto tail = energyBetween(rung, sampleRate, 0.5, 0.9), plainTail = energyBetween(plainTone, sampleRate, 0.5, 0.9);
+    // Bounded by construction: a 0.3 tone may grow at most 1 + kResonanceBoost times.
+    if (!(tail > 100.0 * plainTail + 1.0e-6 && ringPeak < 0.3f * (1.0f + static_cast<float>(holotoner::kResonanceBoost)) + 0.05f)) {
+        std::cerr << "resonate did not ring on a bright row, or was unbounded (tail " << tail << ", peak " << ringPeak << ")\n";
+        ++failures;
+    }
+    // Interfere with Feedback: facing is still flat; turned stays bounded.
+    auto comb = base;
+    comb.interfere = comb.feedback = 1.0f;
+    const auto noise = runSpace(sampleRate, base, nullptr, 0.0);
+    const auto facing = runSpace(sampleRate, comb, nullptr, 0.0);
+    comb.plane.yawDegrees = 50.0f;
+    const auto turned = runSpace(sampleRate, comb, nullptr, 0.0);
+    if (std::abs(facing.left - noise.left) > 1.0e-6 * noise.left || !turned.bounded) {
+        std::cerr << "interfere feedback not flat when facing, or unbounded\n";
+        ++failures;
+    }
+}
+
+void shapesAreDeterministic()
+{
+    using holotoner::ShapeKind;
+    for (int kind = 0; kind < static_cast<int>(holotoner::kShapeNames.size()); ++kind) {
+        const auto shape = static_cast<ShapeKind>(kind);
+        const auto a = holotoner::generateShape(shape, 3), b = holotoner::generateShape(shape, 3);
+        const auto c = holotoner::generateShape(shape, 6);
+        std::size_t lit = 0;
+        for (std::size_t i = 3; i < a.pixels.size(); i += 4) lit += a.pixels[i] > 0 ? 1 : 0;
+        const auto total = a.pixels.size() / 4;
+        if (a.pixels != b.pixels || a.pixels == c.pixels || lit < total / 100 || lit > total * 3 / 4) {
+            std::cerr << "shape " << holotoner::kShapeNames[static_cast<std::size_t>(kind)]
+                      << " not deterministic, order-sensitive or reasonably filled (" << lit << "/" << total << ")\n";
+            ++failures;
+        }
+    }
+    const auto smiley = holotoner::generateShape(ShapeKind::Smiley, 3);
+    const auto smileyInk = [&](double x, double y) {
+        const auto px = static_cast<int>((x + 1.0) * 0.5 * smiley.width);
+        const auto py = static_cast<int>((1.0 - y) * 0.5 * smiley.height);
+        return smiley.pixels[static_cast<std::size_t>((py * smiley.width + px) * 4 + 3)] > 0;
+    };
+    if (!smileyInk(-0.28, 0.28) || !smileyInk(0.28, 0.28) || !smileyInk(0, -0.58)
+        || !smileyInk(0, 0.84) || smileyInk(0, 0) || smileyInk(0, 0.58)) {
+        std::cerr << "smiley must have two eyes, a lower smile and an outline with an empty centre\n";
+        ++failures;
+    }
+    // Clamped orders.
+    if (holotoner::generateShape(ShapeKind::Grid, 0).pixels != holotoner::generateShape(ShapeKind::Grid, 1).pixels) {
+        std::cerr << "shape order not clamped\n";
+        ++failures;
+    }
+}
+
+void deltaHearsOnlyTheChange(double sampleRate)
+{
+    // Delta outputs processed minus dry: nothing when nothing is changed, only the echo with Echo.
+    holotoner::ImageSpatializer::Parameters parameters;
+    parameters.delta = true;
+    // The burst starts at 0.2 s, after the analysis window has filled (before that the
+    // processed path is still silent, so the difference is the dry sound itself).
+    auto burst = toneBurst(sampleRate, 1000.0, 0.06, 1.0);
+    burst.insert(burst.begin(), static_cast<std::size_t>(0.2 * sampleRate), 0.0f);
+    const auto silent = runEffects(sampleRate, parameters, nullptr, burst).first;
+    parameters.echo = 1.0f;
+    const auto echoOnly = runEffects(sampleRate, parameters, nullptr, burst).first;
+    const auto input = energyBetween(burst, sampleRate, 0.2, 0.3);
+    if (!(energyBetween(silent, sampleRate, 0.1, 1.2) < 1.0e-9 * input
+          && energyBetween(echoOnly, sampleRate, 0.1, 0.3) < 1.0e-6 * input
+          && energyBetween(echoOnly, sampleRate, 0.35, 0.8) > 0.1 * input)) {
+        std::cerr << "delta did not isolate what Holotoner changes\n";
+        ++failures;
+    }
+}
+
+void interferenceFollowsGeometry(double sampleRate)
+{
+    holotoner::ImageSpatializer::Parameters facing;
+    auto interfering = facing;
+    interfering.interfere = 1.0f;
+    // Facing: both halves are equally far, so the extra path sums flat.
+    const auto plain = runSpace(sampleRate, facing, nullptr, 0.0);
+    const auto flat = runSpace(sampleRate, interfering, nullptr, 0.0);
+    // Turned: the halves' path difference makes a comb that removes energy.
+    auto turned = interfering;
+    turned.plane.yawDegrees = 50.0f;
+    const auto comb = runSpace(sampleRate, turned, nullptr, 0.0);
+    if (std::abs(flat.left - plain.left) > 1.0e-6 * plain.left || !(comb.left < 0.8 * plain.left) || !comb.bounded) {
+        std::cerr << "interference did not follow geometry: flat " << flat.left / plain.left
+                  << ", turned " << comb.left / plain.left << '\n';
+        ++failures;
+    }
+}
+
+void edgeTradesGritForImage(double sampleRate)
+{
+    // Two tones, nothing above 5 kHz: energy there is the image field's distortion.
+    const auto mask = phaseFixture(false);
+    const auto grit = [&](float edge, float smooth = 0.0f) {
+        constexpr std::size_t count = 65536;
+        std::vector<float> left(count), right(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto t = static_cast<double>(i) / sampleRate;
+            left[i] = static_cast<float>(0.25 * std::sin(2.0 * 3.141592653589793 * 220.0 * t)
+                                         + 0.1 * std::sin(2.0 * 3.141592653589793 * 330.0 * t));
+            right[i] = static_cast<float>(0.2 * std::sin(2.0 * 3.141592653589793 * 220.0 * t + 0.4)
+                                          + 0.12 * std::sin(2.0 * 3.141592653589793 * 330.0 * t));
+        }
+        holotoner::ImageSpatializer engine;
+        holotoner::ImageSpatializer::Parameters parameters;
+        parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
+        parameters.plane.pitchDegrees = 50.0f;
+        parameters.edge = edge;
+        parameters.smooth = smooth;
+        engine.setParameters(parameters);
+        engine.prepare(sampleRate);
+        engine.process(left.data(), right.data(), static_cast<int>(count), &mask);
+        constexpr std::size_t size = 16384;
+        holotoner::Fft fft;
+        fft.prepare(size);
+        std::vector<std::complex<double>> data(size);
+        for (std::size_t i = 0; i < size; ++i) {
+            const auto window = 0.5 - 0.5 * std::cos(2.0 * 3.141592653589793 * static_cast<double>(i) / size);
+            data[i] = {left[count - size + i] * window, right[count - size + i] * window};
+        }
+        fft.transform(data, false);
+        double high = 0.0, all = 0.0;
+        for (std::size_t k = 1; k < size / 2; ++k) {
+            const auto power = std::norm(data[k]) + std::norm(data[size - k]);
+            all += power;
+            if (static_cast<double>(k) * sampleRate / size > 5000.0) high += power;
+        }
+        return 10.0 * std::log10(high / all + 1.0e-30);
+    };
+    const auto hard = grit(1.0f), soft = grit(0.0f);
+    const auto smoothed = grit(1.0f, 0.001f);
+    std::cout << "Smooth 1 ms at " << sampleRate << " Hz: >5 kHz distortion "
+              << hard << " dB -> " << smoothed << " dB\n";
+    if (!(smoothed < hard - 10.0)) {
+        std::cerr << "Smooth did not reduce high-frequency image-field distortion\n";
+        ++failures;
+    }
+
+    if (!(soft < hard - 15.0)) {
+        std::cerr << "Edge 0 did not reduce image-field grit: " << hard << " dB -> " << soft << " dB\n";
+        ++failures;
+    }
+}
+
+void restSteersTheBackground(double sampleRate)
+{
+    // Rest turns samples the image cannot hold toward mono (-1) or the sides (+1); 0 is unchanged.
+    const auto mask = phaseFixture(false);
+    const auto correlation = [&](float rest) {
+        constexpr std::size_t count = 65536;
+        std::vector<float> left(count), right(count);
+        std::uint32_t seed = 7;
+        double low = 0.0;
+        for (std::size_t i = 0; i < count; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            low += 0.05 * (static_cast<double>(seed >> 8) / 16777216.0 - 0.5 - low);
+            const auto level = 0.5 + 0.5 * std::sin(2.0 * 3.141592653589793 * 1.3 * static_cast<double>(i) / sampleRate);
+            left[i] = right[i] = static_cast<float>(4.0 * level * low);
+        }
+        holotoner::ImageSpatializer engine;
+        holotoner::ImageSpatializer::Parameters parameters;
+        parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
+        parameters.rest = rest;
+        engine.setParameters(parameters);
+        engine.prepare(sampleRate);
+        engine.process(left.data(), right.data(), static_cast<int>(count), &mask);
+        double ll = 0.0, rr = 0.0, lr = 0.0, energy = 0.0;
+        for (std::size_t i = 16384; i < count; ++i) {
+            ll += static_cast<double>(left[i]) * left[i];
+            rr += static_cast<double>(right[i]) * right[i];
+            lr += static_cast<double>(left[i]) * right[i];
+        }
+        energy = ll + rr;
+        return std::pair {lr / std::sqrt(ll * rr + 1.0e-30), energy};
+    };
+    const auto [narrow, narrowEnergy] = correlation(-1.0f);
+    const auto [plain, plainEnergy] = correlation(0.0f);
+    const auto [wide, wideEnergy] = correlation(1.0f);
+    if (!(narrow > plain + 0.01 && wide < plain - 0.1)
+        || std::abs(narrowEnergy - plainEnergy) > 1.0e-6 * plainEnergy || std::abs(wideEnergy - plainEnergy) > 1.0e-6 * plainEnergy) {
+        std::cerr << "rest did not steer the background by rotation: " << narrow << " / " << plain << " / " << wide << '\n';
+        ++failures;
+    }
+}
+
+void smoothRetainsEnergyAndPartition(double sampleRate)
+{
+    const auto mask = phaseFixture(false);
+    constexpr std::size_t count = 32768;
+    const auto render = [&](float smooth, int block, bool image = true) {
+        std::pair<std::vector<float>, std::vector<float>> output {std::vector<float>(count), std::vector<float>(count)};
+        for (std::size_t i = 0; i < count; ++i) {
+            output.first[i] = 0.2f * std::sin(static_cast<float>(i) * 0.13f);
+            output.second[i] = 0.17f * std::cos(static_cast<float>(i) * 0.077f);
+        }
+        auto engine = std::make_unique<holotoner::ImageSpatializer>();
+        holotoner::ImageSpatializer::Parameters parameters;
+        parameters.smooth = smooth;
+        parameters.plane.scaleX = parameters.plane.scaleY = 0.8f;
+        parameters.imageAmount = image ? 1.0f : 0.0f;
+        engine->setParameters(parameters);
+        engine->prepare(sampleRate);
+        for (std::size_t at = 0; at < count; at += static_cast<std::size_t>(block))
+            engine->process(output.first.data()+at, output.second.data()+at, static_cast<int>(std::min(static_cast<std::size_t>(block),count-at)), &mask);
+        return output;
+    };
+    const auto hard = render(0,512), smooth = render(0.001f,512);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto energy = [](float l,float r) { return static_cast<double>(l)*l+static_cast<double>(r)*r; };
+        if (!std::isfinite(smooth.first[i]) || !std::isfinite(smooth.second[i])
+            || std::abs(energy(hard.first[i],hard.second[i])-energy(smooth.first[i],smooth.second[i])) > 3.0e-8) {
+            std::cerr << "Smooth changed sample energy or produced invalid output\n"; ++failures; break;
+        }
+    }
+    for (int block : {1,31}) {
+        const auto split = render(0.001f,block);
+        if (split != smooth) { std::cerr << "Smooth depends on block partition\n"; ++failures; }
+    }
+    if (render(0,31,false) != render(0.005f,31,false)) {
+        std::cerr << "Smooth changed image-off output\n"; ++failures;
+    }
+}
+
 int main()
 {
     {
@@ -692,6 +1072,19 @@ int main()
     imageFieldMeasuredSupport(44100.0);
     imageFieldMeasuredSupport(48000.0);
     imageFieldMeasuredSupport(96000.0);
+    for (const auto rate : {44100.0, 48000.0, 96000.0})
+        spaceEffects(rate);
+    shapesAreDeterministic();
+    for (const auto rate : {44100.0, 48000.0, 96000.0})
+        deltaHearsOnlyTheChange(rate);
+    for (const auto rate : {44100.0, 48000.0, 96000.0})
+        restSteersTheBackground(rate);
+    for (const auto rate : {44100.0, 48000.0, 96000.0})
+        edgeTradesGritForImage(rate);
+    for (const auto rate : {44100.0, 48000.0, 96000.0})
+        smoothRetainsEnergyAndPartition(rate);
+    for (const auto rate : {44100.0, 48000.0, 96000.0})
+        interferenceFollowsGeometry(rate);
     if (failures != 0)
         std::cerr << failures << " test assertion(s) failed\n";
     return failures == 0 ? 0 : 1;
