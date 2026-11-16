@@ -1,7 +1,7 @@
 # Holotoner
 
-Holotoner turns an image into a stereo field. Move, scale and rotate the image
-plane, and hear the space change. Use an image, text or a generated shape.
+Holotoner shapes a sound's stereo field with images. Move, scale and rotate the
+image plane, and hear the space change. Use an image, text or a generated shape.
 Available as Standalone, VST3, AU and a browser application.
 
 See it live: [**https://janne-s.github.io/Holotoner/**](https://janne-s.github.io/Holotoner/)
