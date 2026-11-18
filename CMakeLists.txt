@@ -3,9 +3,7 @@ cmake_minimum_required(VERSION 3.25)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum macOS version")
 set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures")
 
-# 0.0.0 is an unreleased-development sentinel. The first public version number
-# is assigned only when the corresponding production release is complete.
-project(Holotoner VERSION 0.0.0 LANGUAGES C CXX)
+project(Holotoner VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

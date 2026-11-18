@@ -6,6 +6,8 @@ Available as Standalone, VST3, AU and a browser application.
 
 See it live: [**https://janne-s.github.io/Holotoner/**](https://janne-s.github.io/Holotoner/)
 
+Standalone and plug-in for macOS (VST3, AU): [**download the latest release**](https://github.com/janne-s/Holotoner/releases/latest)
+
 ![Holotoner interface](web/assets/screenshot.jpg)
 
 ## How it works
@@ -61,6 +63,18 @@ The Space plot shows level and echo time by frequency.
 Play the demo or load a local audio file. Save and Open store parameters and
 image frames; audio is loaded separately. Media stays on your device.
 See [web/README.md](web/README.md) for local use and GitHub Pages.
+
+## Install
+
+macOS 11 or later, Apple silicon and Intel. Unzip the release, then copy
+`Holotoner.app` to `/Applications`, `Holotoner.vst3` to
+`~/Library/Audio/Plug-Ins/VST3/` and `Holotoner.component` to
+`~/Library/Audio/Plug-Ins/Components/`. The build is not notarized, so clear
+the quarantine once:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Holotoner.app ~/Library/Audio/Plug-Ins/VST3/Holotoner.vst3 ~/Library/Audio/Plug-Ins/Components/Holotoner.component
+```
 
 ## Build
 
