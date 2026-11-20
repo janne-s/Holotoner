@@ -166,7 +166,7 @@ private:
     float meterOutputLeft_ = 0.0f;      ///< audio thread
     float meterOutputRight_ = 0.0f;     ///< audio thread
     float meterDecayPerSample_ = 0.0f;  ///< audio thread
-    static constexpr std::size_t kScopeHistory = 32768;
+    static constexpr std::size_t kScopeHistory = 8192; ///< the editor reads the last 4096
     std::array<std::atomic<std::uint64_t>, kScopeHistory> scopeInput_ {}, scopeOutput_ {};
     std::atomic<std::uint64_t> scopePublished_ {0};
     std::uint64_t scopeWritten_ = 0; ///< audio thread only

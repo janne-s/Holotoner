@@ -897,7 +897,9 @@ private:
     }
 
     HolotonerProcessor& processor_;
-    std::array<HolotonerProcessor::ScopeSample, 16384> samples_ {};
+    // The last 4096 samples (about 85 ms at 48 kHz), as in the browser wrapper. A longer
+    // window left an afterimage of the previous state while the plane moved.
+    std::array<HolotonerProcessor::ScopeSample, 4096> samples_ {};
     CachedLayer background_, labels_;
     juce::Image samplesImage_;
     std::uint64_t shownSequence_ = 0;

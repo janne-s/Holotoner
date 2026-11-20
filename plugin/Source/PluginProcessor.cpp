@@ -544,10 +544,11 @@ int HolotonerProcessor::scopeSamples(ScopeSample* destination, int capacity) con
     if (destination == nullptr || capacity <= 0)
         return 0;
     const auto end = scopePublished_.load(std::memory_order_acquire);
-    const auto available = std::min(end, static_cast<std::uint64_t>(kScopeHistory));
-    const auto count = std::min(available, static_cast<std::uint64_t>(capacity));
+    // The most recent samples, contiguous: the scope shows only the last `capacity`
+    // samples, so a change is seen as soon as it is heard.
+    const auto count = std::min({end, static_cast<std::uint64_t>(kScopeHistory), static_cast<std::uint64_t>(capacity)});
     for (std::uint64_t i = 0; i < count; ++i) {
-        const auto at = (end - available + i * available / count) % kScopeHistory;
+        const auto at = (end - count + i) % kScopeHistory;
         const auto input = std::bit_cast<std::array<float, 2>>(scopeInput_[at].load(std::memory_order_relaxed));
         const auto output = std::bit_cast<std::array<float, 2>>(scopeOutput_[at].load(std::memory_order_relaxed));
         destination[i] = {input[0], input[1], output[0], output[1]};
