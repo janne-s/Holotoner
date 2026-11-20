@@ -98,6 +98,15 @@ private:
     ProjectedPlane imagePlane_,previousImagePlane_;
     void constrainField(double& left, double& right);
     double fieldRotation(double left, double right);
+    /// One search for image support along the arc at `radius` (scope units), from `start`
+    /// (radians), with the geometry `blend` of the way from the last hop's plane to this one's.
+    struct FieldSolution { double angle = 0; bool hard = false; double soft = 0; bool degenerate = false; };
+    FieldSolution solveField(double radius, double start, float blend) const;
+    /// Leftmost and rightmost supported directions (radians) at a level, per hop.
+    struct Span { double left = 0, right = 0; bool valid = false; };
+    static constexpr std::size_t kSpanLevels = 65;
+    std::array<Span, kSpanLevels> spanCurrent_ {}, spanPrevious_ {};
+    Span spanAt(double radius) const;
     // Space: smoothed row brightness (compiled on mask change, never per bin).
     std::array<double,kImageMaskHeight> rowWeight_ {},rowWeightTarget_ {};
     // Echo: a per-bin spectral history of frames, sized in prepare for kEchoMaxSeconds.

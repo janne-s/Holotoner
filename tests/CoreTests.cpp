@@ -2,6 +2,7 @@
 #include "core/audio/SourcePlayer.h"
 #include "core/dsp/Fft.h"
 #include "core/dsp/ImageSpatializer.h"
+#include "core/dsp/PhaseMap.h"
 #include "core/dsp/StereoWidth.h"
 #include "core/geometry/PlaneProjection.h"
 #include "core/geometry/Motion.h"
@@ -947,6 +948,63 @@ void edgeTradesGritForImage(double sampleRate)
     }
 }
 
+void imageSpreadsAcrossTheImage(double sampleRate)
+{
+    // Four letters side by side. Before, every direction outside the image snapped to the two
+    // outermost strokes: the outer letters took 3-4x the inner ones' samples (mono and stereo).
+    holotoner::RgbaImage image;
+    image.width = image.height = 64;
+    image.pixels.assign(64 * 64 * 4, 255);
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 64; ++x) {
+            const auto inLetter = (x - 2) % 16;
+            const bool on = y >= 20 && y < 44 && x >= 2 && inLetter < 13
+                && (inLetter < 3 || inLetter >= 10 || y < 23 || (y >= 31 && y < 34));
+            for (std::size_t c = 0; c < 3; ++c)
+                image.pixels[static_cast<std::size_t>((y * 64 + x) * 4) + c] = on ? 255 : 0;
+        }
+    holotoner::ImageMaskSettings settings;
+    settings.channel = holotoner::PixelChannel::Luma;
+    settings.binary = true;
+    settings.threshold = 0.5f;
+    const auto mask = holotoner::buildImageMask(image, settings);
+    for (const bool stereo : {false, true}) {
+        const auto count = static_cast<std::size_t>(4.0 * sampleRate);
+        std::vector<float> left(count), right(count);
+        std::uint32_t seed = 11;
+        const auto gaussian = [&seed] { // Box-Muller from a fixed LCG: identical on every platform
+            seed = seed * 1664525u + 1013904223u;
+            const auto u = (static_cast<double>(seed >> 8) + 1.0) / 16777217.0;
+            seed = seed * 1664525u + 1013904223u;
+            const auto v = static_cast<double>(seed >> 8) / 16777216.0;
+            return 0.03 * std::sqrt(-2.0 * std::log(u)) * std::cos(2.0 * 3.141592653589793 * v);
+        };
+        for (std::size_t i = 0; i < count; ++i) {
+            left[i] = static_cast<float>(gaussian());
+            right[i] = stereo ? static_cast<float>(gaussian()) : left[i];
+        }
+        holotoner::ImageSpatializer engine;
+        engine.setParameters({});
+        engine.prepare(sampleRate);
+        engine.process(left.data(), right.data(), static_cast<int>(count), &mask);
+        // Letters occupy scope x [-0.47,-0.27], [-0.22,-0.02], [0.03,0.23], [0.28,0.48].
+        std::array<double, 4> letters {};
+        for (std::size_t i = count / 4; i < count; ++i) {
+            const auto point = holotoner::stereoToScopePoint(5.0f * left[i], 5.0f * right[i]);
+            const auto letter = static_cast<int>(std::floor((point.x + 0.49f) / 0.25f));
+            if (point.y > 0.05f && letter >= 0 && letter < 4)
+                letters[static_cast<std::size_t>(letter)] += 1.0;
+        }
+        const auto [low, high] = std::minmax_element(letters.begin(), letters.end());
+        std::cout << "Image spread " << sampleRate << (stereo ? " stereo" : " mono") << ": letters "
+                  << letters[0] << '/' << letters[1] << '/' << letters[2] << '/' << letters[3] << '\n';
+        if (!(*low > 0.45 * *high)) {
+            std::cerr << "image steering crowds some strokes: min/max " << *low / *high << '\n';
+            ++failures;
+        }
+    }
+}
+
 void restSteersTheBackground(double sampleRate)
 {
     // Rest turns samples the image cannot hold toward mono (-1) or the sides (+1); 0 is unchanged.
@@ -1079,6 +1137,8 @@ int main()
         deltaHearsOnlyTheChange(rate);
     for (const auto rate : {44100.0, 48000.0, 96000.0})
         restSteersTheBackground(rate);
+    for (const auto rate : {44100.0, 48000.0, 96000.0})
+        imageSpreadsAcrossTheImage(rate);
     for (const auto rate : {44100.0, 48000.0, 96000.0})
         edgeTradesGritForImage(rate);
     for (const auto rate : {44100.0, 48000.0, 96000.0})

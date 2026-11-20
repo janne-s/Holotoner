@@ -16,6 +16,11 @@ constexpr double kRunaway = 16.0;
 constexpr double kAttraction = 0.2;
 constexpr double kAttractionSpan = 30.0;
 constexpr double kRestSide = 1.0;
+// Image steering spreads samples across the image's width at their level: by direction,
+// and near mono (|direction| / (pi/2) within about kSpreadMono) by level, one sweep
+// across and back per kSpreadDb.
+constexpr double kSpreadDb = 6.0;
+constexpr double kSpreadMono = 0.1;
 constexpr double kEchoLevel = 2.0; // Echo at 100%: delayed level relative to the direct sound // radians from mono where Rest +100% sends unheld samples
 
 float finiteOr(float value, float fallback) { return std::isfinite(value) ? value : fallback; }
@@ -68,6 +73,8 @@ void ImageSpatializer::reset()
     fieldFollow_ = previousFieldFollow_ = parameters_.smooth > 0.0f
         ? -std::expm1(-1.0 / (sampleRate_ * parameters_.smooth)) : 1.0;
     fieldHasSupport_ = false;
+    spanCurrent_.fill({});
+    spanPrevious_.fill({});
     supportValues_.fill(0);
     softSupport_.fill(0);
     fieldAspectX_ = fieldAspectY_ = 1;
@@ -297,6 +304,102 @@ void ImageSpatializer::smoothFrameState(const ImageMask* mask)
     imageTransform.scaleY *= fieldAspectY_;
     previousImagePlane_ = imagePlane_;
     imagePlane_ = projectPlane(imageTransform);
+    // The image's angular extent per level, for the plane this hop blends toward. Per
+    // sample, spanAt() interpolates in level and between this hop's and the last hop's.
+    spanPrevious_ = spanCurrent_;
+    for (std::size_t i = 0; i < kSpanLevels; ++i) {
+        const auto radius = static_cast<double>(i)/static_cast<double>(kSpanLevels-1);
+        const auto left = fieldHasSupport_ ? solveField(radius, -0.5*std::numbers::pi, 1.0f) : FieldSolution {};
+        const auto right = fieldHasSupport_ ? solveField(radius, 0.5*std::numbers::pi, 1.0f) : FieldSolution {};
+        spanCurrent_[i] = {left.angle, right.angle, left.hard && right.hard};
+    }
+}
+
+ImageSpatializer::Span ImageSpatializer::spanAt(double radius) const
+{
+    const auto lookup = [radius](const std::array<Span, kSpanLevels>& table) {
+        const auto position = std::clamp(radius, 0.0, 1.0)*static_cast<double>(kSpanLevels-1);
+        const auto low = std::min(static_cast<std::size_t>(position), kSpanLevels-2);
+        const auto t = position-static_cast<double>(low);
+        const auto& p = table[low]; const auto& q = table[low+1];
+        if (p.valid && q.valid) return Span {p.left+t*(q.left-p.left), p.right+t*(q.right-p.right), true};
+        return t < 0.5 ? p : q;
+    };
+    const auto previous = lookup(spanPrevious_), current = lookup(spanCurrent_);
+    const auto blend = static_cast<double>(geometryBlend_);
+    if (previous.valid && current.valid)
+        return {previous.left+blend*(current.left-previous.left), previous.right+blend*(current.right-previous.right), true};
+    return blend < 0.5 ? previous : current;
+}
+
+ImageSpatializer::FieldSolution ImageSpatializer::solveField(double radius, double start, float blend) const
+{
+    const auto corner = [this, blend](int i) {
+        const auto& p = previousImagePlane_.corners[static_cast<std::size_t>(i)];
+        const auto& q = imagePlane_.corners[static_cast<std::size_t>(i)];
+        return ProjectedPoint {p.stereo+blend*(q.stereo-p.stereo),
+            p.frequency+blend*(q.frequency-p.frequency),0};
+    };
+    const auto a = corner(0),b = corner(1),d = corner(3);
+    const auto bx = b.stereo-a.stereo, by = b.frequency-a.frequency;
+    const auto dx = d.stereo-a.stereo, dy = d.frequency-a.frequency;
+    const auto determinant = static_cast<double>(bx*dy-by*dx);
+    if (std::abs(determinant) < 1.0e-7) return {start, false, 0.0, true};
+    const auto imageCoordinates = [&](double direction) {
+        const auto x = parameters_.phaseProjection == PhaseProjection::Cartesian
+            ? 2*radius*std::sin(direction) : direction*4/std::numbers::pi;
+        const auto y = parameters_.phaseProjection == PhaseProjection::Cartesian
+            ? 2*(radius*std::cos(direction)-0.5) : 4*(radius-0.5);
+        return ImageMask::PhasePoint {static_cast<float>(63*((x-a.stereo)*dy-(y-a.frequency)*dx)/determinant),
+            static_cast<float>(63*(1-(bx*(y-a.frequency)-by*(x-a.stereo))/determinant))};
+    };
+    // Only queries immutable image-coordinate maps; no rasterization/field compilation here.
+    FieldSolution solution {start, false, 0.0};
+    auto targetAngle = start;
+    for (int iteration = 0; iteration < 16; ++iteration) {
+        const auto query = imageCoordinates(targetAngle);
+        const auto px = std::clamp(query.x,0.0f,63.0f), py = std::clamp(query.y,0.0f,63.0f);
+        const auto ix = static_cast<int>(px), iy = static_cast<int>(py);
+        const auto nx = std::min(ix+1,63), ny = std::min(iy+1,63);
+        const auto tx = px-static_cast<float>(ix), ty = py-static_cast<float>(iy);
+        const auto read = [&](int x,int y) {
+            const auto at = static_cast<std::size_t>(y*64+x);
+            const auto& p = previousNearest_[at]; const auto& q = nearest_[at];
+            return ImageMask::PhasePoint {p.x+blend*(q.x-p.x),p.y+blend*(q.y-p.y)};
+        };
+        const auto p = read(ix,iy), q = read(nx,iy), r = read(ix,ny), s = read(nx,ny);
+        const auto nearX = (p.x*(1-tx)+q.x*tx)*(1-ty)+(r.x*(1-tx)+s.x*tx)*ty;
+        const auto nearY = (p.y*(1-tx)+q.y*tx)*(1-ty)+(r.y*(1-tx)+s.y*tx)*ty;
+        const auto u = nearX/63, v = 1-nearY/63;
+        const auto worldX = a.stereo+u*bx+v*dx, worldY = a.frequency+u*by+v*dy;
+        const auto scopeX = 0.5*worldX, scopeY = 0.5+0.5*worldY;
+        const auto previousAngle = targetAngle;
+        if (parameters_.phaseProjection == PhaseProjection::Cartesian) {
+            if (scopeY < 0) break;
+            targetAngle = std::atan2(scopeX,scopeY);
+        } else targetAngle = std::clamp(static_cast<double>(worldX)*std::numbers::pi/4,-0.5*std::numbers::pi,0.5*std::numbers::pi);
+        if (std::abs(targetAngle-previousAngle) < 1.0e-5) break;
+    }
+    solution.angle = targetAngle;
+    const auto finalPoint = imageCoordinates(targetAngle);
+    if (!std::isfinite(finalPoint.x) || !std::isfinite(finalPoint.y)
+        || finalPoint.x < -2 || finalPoint.x > 65 || finalPoint.y < -2 || finalPoint.y > 65) return solution;
+    const auto fx = static_cast<int>(std::lround(finalPoint.x)), fy = static_cast<int>(std::lround(finalPoint.y));
+    for (int y = -2; y <= 2; ++y)
+        for (int x = -2; x <= 2; ++x) {
+            const auto px = fx+x,py = fy+y;
+            if (px>=0 && px<64 && py>=0 && py<64)
+                solution.hard = solution.hard || supportValues_[static_cast<std::size_t>(py*64+px)]>0.001f;
+        }
+    // Soft support: bilinear in the softened map, fading out over 3 px beyond the bitmap.
+    const auto cx = std::clamp(finalPoint.x,0.0f,63.0f), cy = std::clamp(finalPoint.y,0.0f,63.0f);
+    const auto outside = std::hypot(finalPoint.x-cx, finalPoint.y-cy);
+    const auto ix = std::min(static_cast<int>(cx),62), iy = std::min(static_cast<int>(cy),62);
+    const auto tx = cx-static_cast<float>(ix), ty = cy-static_cast<float>(iy);
+    const auto at = [this](int x,int y) { return softSupport_[static_cast<std::size_t>(y*64+x)]; };
+    const auto value = (at(ix,iy)*(1-tx)+at(ix+1,iy)*tx)*(1-ty)+(at(ix,iy+1)*(1-tx)+at(ix+1,iy+1)*tx)*ty;
+    solution.soft = std::clamp(3.0*static_cast<double>(value)*std::max(0.0,1.0-static_cast<double>(outside)/3.0),0.0,1.0);
+    return solution;
 }
 
 double ImageSpatializer::fieldRotation(double left, double right)
@@ -313,87 +416,34 @@ double ImageSpatializer::fieldRotation(double left, double right)
     const auto angle = std::atan2(polarity*side, std::abs(mid));
     // Same calibrated level axis as the measured +14 dB scope. No audio gain is applied.
     const auto radius = std::clamp(1.0 + std::log10(std::max(level*5.0, 1.0e-6))/3.0, 0.0, 1.0);
-    const auto corner = [this](int i) {
-        const auto& p = previousImagePlane_.corners[static_cast<std::size_t>(i)];
-        const auto& q = imagePlane_.corners[static_cast<std::size_t>(i)];
-        return ProjectedPoint {p.stereo+geometryBlend_*(q.stereo-p.stereo),
-            p.frequency+geometryBlend_*(q.frequency-p.frequency),0};
-    };
-    const auto a = corner(0),b = corner(1),d = corner(3);
-    const auto bx = b.stereo-a.stereo, by = b.frequency-a.frequency;
-    const auto dx = d.stereo-a.stereo, dy = d.frequency-a.frequency;
-    const auto determinant = static_cast<double>(bx*dy-by*dx);
-    if (std::abs(determinant) < 1.0e-7) return 0.0;
-    const auto imageCoordinates = [&](double direction) {
-        const auto x = parameters_.phaseProjection == PhaseProjection::Cartesian
-            ? 2*radius*std::sin(direction) : direction*4/std::numbers::pi;
-        const auto y = parameters_.phaseProjection == PhaseProjection::Cartesian
-            ? 2*(radius*std::cos(direction)-0.5) : 4*(radius-0.5);
-        return ImageMask::PhasePoint {static_cast<float>(63*((x-a.stereo)*dy-(y-a.frequency)*dx)/determinant),
-            static_cast<float>(63*(1-(bx*(y-a.frequency)-by*(x-a.stereo))/determinant))};
-    };
-    // One search from a start angle: image support, then the original sample's radius.
-    // Only queries immutable image-coordinate maps; no rasterization/field compilation here.
-    struct Solution { double angle = 0; bool hard = false; double soft = 0; };
-    const auto solve = [&](double start) {
-        Solution solution {start, false, 0.0};
-        auto targetAngle = start;
-        for (int iteration = 0; iteration < 16; ++iteration) {
-            const auto query = imageCoordinates(targetAngle);
-            const auto px = std::clamp(query.x,0.0f,63.0f), py = std::clamp(query.y,0.0f,63.0f);
-            const auto ix = static_cast<int>(px), iy = static_cast<int>(py);
-            const auto nx = std::min(ix+1,63), ny = std::min(iy+1,63);
-            const auto tx = px-static_cast<float>(ix), ty = py-static_cast<float>(iy);
-            const auto read = [&](int x,int y) {
-                const auto at = static_cast<std::size_t>(y*64+x);
-                const auto& p = previousNearest_[at]; const auto& q = nearest_[at];
-                return ImageMask::PhasePoint {p.x+geometryBlend_*(q.x-p.x),p.y+geometryBlend_*(q.y-p.y)};
-            };
-            const auto p = read(ix,iy), q = read(nx,iy), r = read(ix,ny), s = read(nx,ny);
-            const auto nearX = (p.x*(1-tx)+q.x*tx)*(1-ty)+(r.x*(1-tx)+s.x*tx)*ty;
-            const auto nearY = (p.y*(1-tx)+q.y*tx)*(1-ty)+(r.y*(1-tx)+s.y*tx)*ty;
-            const auto u = nearX/63, v = 1-nearY/63;
-            const auto worldX = a.stereo+u*bx+v*dx, worldY = a.frequency+u*by+v*dy;
-            const auto scopeX = 0.5*worldX, scopeY = 0.5+0.5*worldY;
-            const auto previousAngle = targetAngle;
-            if (parameters_.phaseProjection == PhaseProjection::Cartesian) {
-                if (scopeY < 0) break;
-                targetAngle = std::atan2(scopeX,scopeY);
-            } else targetAngle = std::clamp(static_cast<double>(worldX)*std::numbers::pi/4,-0.5*std::numbers::pi,0.5*std::numbers::pi);
-            if (std::abs(targetAngle-previousAngle) < 1.0e-5) break;
-        }
-        solution.angle = targetAngle;
-        const auto finalPoint = imageCoordinates(targetAngle);
-        if (!std::isfinite(finalPoint.x) || !std::isfinite(finalPoint.y)
-            || finalPoint.x < -2 || finalPoint.x > 65 || finalPoint.y < -2 || finalPoint.y > 65) return solution;
-        const auto fx = static_cast<int>(std::lround(finalPoint.x)), fy = static_cast<int>(std::lround(finalPoint.y));
-        for (int y = -2; y <= 2; ++y)
-            for (int x = -2; x <= 2; ++x) {
-                const auto px = fx+x,py = fy+y;
-                if (px>=0 && px<64 && py>=0 && py<64)
-                    solution.hard = solution.hard || supportValues_[static_cast<std::size_t>(py*64+px)]>0.001f;
-            }
-        // Soft support: bilinear in the softened map, fading out over 3 px beyond the bitmap.
-        const auto cx = std::clamp(finalPoint.x,0.0f,63.0f), cy = std::clamp(finalPoint.y,0.0f,63.0f);
-        const auto outside = std::hypot(finalPoint.x-cx, finalPoint.y-cy);
-        const auto ix = std::min(static_cast<int>(cx),62), iy = std::min(static_cast<int>(cy),62);
-        const auto tx = cx-static_cast<float>(ix), ty = cy-static_cast<float>(iy);
-        const auto at = [this](int x,int y) { return softSupport_[static_cast<std::size_t>(y*64+x)]; };
-        const auto value = (at(ix,iy)*(1-tx)+at(ix+1,iy)*tx)*(1-ty)+(at(ix,iy+1)*(1-tx)+at(ix+1,iy+1)*tx)*ty;
-        solution.soft = std::clamp(3.0*static_cast<double>(value)*std::max(0.0,1.0-static_cast<double>(outside)/3.0),0.0,1.0);
-        return solution;
-    };
-    const auto first = solve(angle);
+    const auto solve = [&](double from) { return solveField(radius, from, geometryBlend_); };
+    // Spread over the image's extent at this level. Starting from the sample's own
+    // direction sent every direction outside the image to its two outermost strokes.
+    // Instead, the direction (-pi/2..pi/2) is scaled onto the arc between the leftmost
+    // and rightmost support. Near mono, where direction carries no spread, a triangle of
+    // the sample's own level (period kSpreadDb) takes over. Both maps are continuous;
+    // the sample is only rotated, its level is kept.
+    auto start = angle;
+    if (const auto span = spanAt(radius); span.valid) {
+        const auto direction = angle/(0.5*std::numbers::pi);
+        const auto phase = 20.0*std::log10(level)/kSpreadDb;
+        const auto triangle = 1.0 - 4.0*std::abs(phase - std::floor(phase) - 0.5);
+        const auto mono = std::exp(-(direction/kSpreadMono)*(direction/kSpreadMono));
+        const auto spread = std::clamp((1.0-mono)*direction + mono*triangle, -1.0, 1.0);
+        start = span.left + 0.5*(spread+1.0)*(span.right-span.left);
+    }
+    const auto first = solve(start);
+    if (first.degenerate) return 0.0; // edge-on plane: nothing to steer toward
     const auto edge = static_cast<double>(smoothedParameters_.edge);
     // Fallback start for samples whose own direction finds no support.
     const auto needFallback = !first.hard || edge < 1.0;
-    const auto second = needFallback ? solve(-std::copysign(0.8,angle)) : Solution {};
+    const auto second = needFallback ? solve(-std::copysign(0.8,angle)) : FieldSolution {};
     const auto hard = first.hard ? first.angle-angle : second.hard ? second.angle-angle : 0.0;
     // Soft: attraction fades with the distance moved, so a sample between two strokes is
     // barely moved instead of jumping from one stroke's angle to the other's.
     const auto width = kAttraction*std::pow(kAttractionSpan, edge);
     // Support also hardens with Edge, so the soft map's halo shrinks toward the hard one.
-    const auto pull = [width,edge](const Solution& solution, double from) {
+    const auto pull = [width,edge](const FieldSolution& solution, double from) {
         const auto moved = (solution.angle-from)/width;
         const auto support = edge*(solution.hard ? 1.0 : 0.0) + (1.0-edge)*solution.soft;
         return support*std::exp(-moved*moved);
